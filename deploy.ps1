@@ -287,6 +287,8 @@ try {
         }
         Enable-WindowsOptionalFeature -Online -FeatureName Containers -NoRestart -All | Out-Null
         Write-Output "Containers feature enabled"
+        wsl --update 2>&1 | ForEach-Object { Write-Output $_ }
+        Write-Output "WSL updated"
     }
 
     # ── 3. Install Python ────────────────────────────────────────────────
