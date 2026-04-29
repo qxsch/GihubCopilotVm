@@ -27,7 +27,7 @@ The script provisions the VM, connects via WinRM, installs all dev tools, and ha
 | Python | 3.12 |
 | PowerShell | 7.x |
 | Visual Studio Code | Latest |
-| GitHub CLI + Copilot CLI | Latest |
+| GitHub CLI + GitHub Copilot CLI | Latest |
 | Az PowerShell module | Latest |
 | Microsoft.Graph module | Latest |
 | Chocolatey | Latest |
@@ -42,6 +42,8 @@ The script provisions the VM, connects via WinRM, installs all dev tools, and ha
 - Markdown All in One & Mermaid
 - Remote - WSL
 - Docker
+- Azure Tools
+- Dev Containers
 
 ---
 

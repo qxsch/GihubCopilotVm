@@ -327,7 +327,7 @@ try {
     Invoke-RemoteStep -Session $session -StepName "Installing Visual Studio Code" -Script {
         $ProgressPreference = 'SilentlyContinue'
         $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
-        choco install vscode --yes --no-progress --params "/NoDesktopIcon" 2>&1 | Select-String -Pattern '(install|downloaded|The install)' | ForEach-Object { Write-Output $_.Line.Trim() }
+        choco install vscode --yes --no-progress --params "/NoDesktopIcon /MERGETASKS=!runcode,addcontextmenufiles,addcontextmenufolders,associatewithfiles,addtopath" 2>&1 | Select-String -Pattern '(install|downloaded|The install)' | ForEach-Object { Write-Output $_.Line.Trim() }
         $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
         $codePath = "C:\Program Files\Microsoft VS Code\bin\code.cmd"
         if (Test-Path $codePath) { Write-Output "VS Code installed" }
@@ -341,8 +341,15 @@ try {
         $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
         $ghVer = & gh --version 2>&1 | Select-Object -First 1
         Write-Output "$ghVer installed"
-        & gh extension install github/gh-copilot --force 2>&1 | Out-Null
-        Write-Output "gh-copilot extension installed"
+        # Install GitHub Copilot CLI (standalone) via winget
+        $wingetCheck = winget list --id GitHub.Copilot --accept-source-agreements 2>&1 | Out-String
+        if ($wingetCheck -match 'GitHub.Copilot') {
+            Write-Output "GitHub Copilot CLI already installed"
+        } else {
+            winget install GitHub.Copilot --accept-source-agreements --accept-package-agreements --silent 2>&1 | ForEach-Object { Write-Output $_ }
+            Write-Output "GitHub Copilot CLI installed"
+        }
+        $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
     }
 
     # ── 8. Install Az PowerShell module ──────────────────────────────────
@@ -408,9 +415,16 @@ $extensions = @(
     "bierner.markdown-mermaid"
     "ms-vscode-remote.remote-wsl"
     "ms-azuretools.vscode-docker"
+    "ms-vscode.vscode-node-azure-pack"
+    "ms-vscode-remote.remote-containers"
 )
 foreach ($ext in $extensions) {
     & $codePath --install-extension $ext --force 2>&1 | Out-Null
+}
+# Install gh-copilot extension (requires interactive user session)
+$ghPath = (Get-Command gh -ErrorAction SilentlyContinue).Source
+if ($ghPath) {
+    & gh extension install github/gh-copilot --force 2>&1 | Out-Null
 }
 Unregister-ScheduledTask -TaskName "InstallVSCodeExtensions" -Confirm:$false -ErrorAction SilentlyContinue
 '@
@@ -421,7 +435,7 @@ Unregister-ScheduledTask -TaskName "InstallVSCodeExtensions" -Confirm:$false -Er
         $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
         Register-ScheduledTask -TaskName "InstallVSCodeExtensions" -Action $action -Trigger $trigger -Settings $settings -RunLevel Highest -Force | Out-Null
 
-        $extList = @("GitHub.copilot","GitHub.copilot-chat","ms-python.python","ms-vscode.azure-account","ms-vscode.powershell","yzhang.markdown-all-in-one","bierner.markdown-mermaid","ms-azuretools.vscode-docker")
+        $extList = @("GitHub.copilot","GitHub.copilot-chat","ms-python.python","ms-vscode.azure-account","ms-vscode.powershell","yzhang.markdown-all-in-one","bierner.markdown-mermaid","ms-azuretools.vscode-docker","ms-vscode.vscode-node-azure-pack","ms-vscode-remote.remote-containers")
         Write-Output "$($extList.Count)+ extensions scheduled for first login of '$User'"
     } -ArgumentList $VMUser
 
@@ -460,6 +474,10 @@ Unregister-ScheduledTask -TaskName "InstallVSCodeExtensions" -Confirm:$false -Er
         # GitHub CLI + Copilot
         $ghVer = & gh --version 2>&1 | Select-Object -First 1
         if ($LASTEXITCODE -eq 0) { $checks += "OK  GitHub CLI: $ghVer" } else { $checks += "FAIL GitHub CLI not found" }
+        # GitHub Copilot CLI (standalone)
+        $copilotCheck = winget list --id GitHub.Copilot --accept-source-agreements 2>&1 | Out-String
+        if ($copilotCheck -match 'GitHub.Copilot') { $checks += "OK  GitHub Copilot CLI installed" } else { $checks += "FAIL GitHub Copilot CLI not found" }
+        $checks += "OK  gh-copilot extension scheduled for first login"
         # Az module
         if (Test-Path $pwshExe) {
             $azVer = & $pwshExe -NoProfile -Command '(Get-InstalledModule Az -ErrorAction SilentlyContinue).Version'
