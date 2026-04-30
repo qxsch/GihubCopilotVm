@@ -37,7 +37,13 @@ param(
     [string]$MstscProfilePath = "",
 
     [Parameter(HelpMessage = "Launch mstsc with the generated .rdp profile after deployment")]
-    [switch]$OpenMstsc
+    [switch]$OpenMstsc,
+
+    [Parameter(HelpMessage = "Deploy VS Code Web interface (HTTPS proxy with login)")]
+    [switch]$InstallVsCodeWeb,
+
+    [Parameter(HelpMessage = "Password for VS Code Web login (defaults to VMPassword)")]
+    [string]$VsCodeWebPassword = ""
 )
 
 
@@ -301,6 +307,16 @@ try {
         Write-Output "$pyVer installed"
     }
 
+    # ── 3b. Install Node.js LTS ───────────────────────────────────────────
+    Invoke-RemoteStep -Session $session -StepName "Installing Node.js LTS" -Script {
+        $ProgressPreference = 'SilentlyContinue'
+        $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
+        choco install nodejs-lts --yes --no-progress 2>&1 | Select-String -Pattern '(install|downloaded|The install)' | ForEach-Object { Write-Output $_.Line.Trim() }
+        $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
+        $nodeVer = & node --version 2>&1
+        Write-Output "Node.js $nodeVer installed"
+    }
+
     # ── 4. Install PowerShell 7 ──────────────────────────────────────────
     Invoke-RemoteStep -Session $session -StepName "Installing PowerShell 7" -Script {
         $ProgressPreference = 'SilentlyContinue'
@@ -316,12 +332,31 @@ try {
 
     # ── 5. Install Docker Desktop ────────────────────────────────────────
     Invoke-RemoteStep -Session $session -StepName "Installing Docker Desktop" -Script {
+        param($Password)
         $ProgressPreference = 'SilentlyContinue'
         $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
         choco install docker-desktop --yes --no-progress 2>&1 | Select-String -Pattern '(install|downloaded|The install)' | ForEach-Object { Write-Output $_.Line.Trim() }
         $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
-        Write-Output "Docker Desktop installed (starts after user login)"
-    }
+
+        # Set Docker service to auto-start
+        $svc = Get-Service -Name "com.docker.service" -ErrorAction SilentlyContinue
+        if ($svc) {
+            Set-Service -Name "com.docker.service" -StartupType Automatic
+            Write-Output "Docker service set to Automatic start"
+        }
+
+        # Register scheduled task to launch Docker Desktop at startup (headless, for Linux containers)
+        $ddPath = "C:\Program Files\Docker\Docker\Docker Desktop.exe"
+        if (Test-Path $ddPath) {
+            $action   = New-ScheduledTaskAction -Execute $ddPath -Argument "--minimize"
+            $trigger  = New-ScheduledTaskTrigger -AtStartup
+            $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+            Register-ScheduledTask -TaskName "DockerDesktop-AutoStart" -Action $action -Trigger $trigger -Settings $settings -RunLevel Highest -User "$env:USERNAME" -Password $Password -Force | Out-Null
+            Write-Output "Docker Desktop scheduled to start at boot"
+        }
+
+        Write-Output "Docker Desktop installed"
+    } -ArgumentList $VMPassword
 
     # ── 6. Install Visual Studio Code ────────────────────────────────────
     Invoke-RemoteStep -Session $session -StepName "Installing Visual Studio Code" -Script {
@@ -331,6 +366,20 @@ try {
         $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
         $codePath = "C:\Program Files\Microsoft VS Code\bin\code.cmd"
         if (Test-Path $codePath) { Write-Output "VS Code installed" }
+    }
+
+    # ── 6b. Install Git ─────────────────────────────────────────────────
+    Invoke-RemoteStep -Session $session -StepName "Installing Git" -Script {
+        $ProgressPreference = 'SilentlyContinue'
+        $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
+        $gitCheck = Get-Command git -ErrorAction SilentlyContinue
+        if ($gitCheck) {
+            Write-Output "Git already installed: $(git --version)"
+        } else {
+            winget install --id Git.Git -e --silent --accept-package-agreements --accept-source-agreements 2>&1 | Out-Null
+            $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
+            Write-Output "$(git --version) installed"
+        }
     }
 
     # ── 7. Install GitHub CLI + Copilot CLI ─────────────────────────────
@@ -450,7 +499,110 @@ Unregister-ScheduledTask -TaskName "InstallVSCodeExtensions" -Confirm:$false -Er
         }
     } -ArgumentList $VMUser
 
-    # ── 12. Verify all software installed ────────────────────────────────
+    # ── 11b. Copy VS Code Web proxy to VM ──────────────────────────────
+    if ($InstallVsCodeWeb) {
+        $vsCodeWebPw = if ($VsCodeWebPassword) { $VsCodeWebPassword } else { $VMPassword }
+        Invoke-RemoteStep -Session $session -StepName "Copying VS Code Web proxy to VM" -Script {
+            $VibeDir = "C:\vscodeweb"
+            if (-not (Test-Path $VibeDir)) { New-Item -ItemType Directory -Path $VibeDir -Force | Out-Null }
+            Write-Output "Target directory ready: $VibeDir"
+        }
+        # Copy server.js via session
+        $vsCodeWebSrc = Join-Path $PSScriptRoot "vscodeweb"
+        $localPath = Join-Path $vsCodeWebSrc "server.js"
+        if (Test-Path $localPath) {
+            $content = Get-Content $localPath -Raw
+            Invoke-Command -Session $session -ScriptBlock {
+                param($fileContent)
+                $fileContent | Out-File -FilePath "C:\vscodeweb\server.js" -Encoding UTF8 -Force
+            } -ArgumentList $content
+        }
+        Write-Ok "VS Code Web proxy copied"
+
+        # ── 12. Install VS Code Web interface ─────────────────────────────────
+        Invoke-RemoteStep -Session $session -StepName "Installing VS Code Web interface" -Script {
+            param($Password, $Port, $CodeServerPort)
+            $ProgressPreference = 'SilentlyContinue'
+            $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
+
+            $VibeDir = "C:\vscodeweb"
+
+            # Install Node.js
+            $nodePath = Get-Command node -ErrorAction SilentlyContinue
+            if (-not $nodePath) {
+                choco install nodejs-lts --yes --no-progress 2>&1 | Out-Null
+                $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
+            }
+            Write-Output "Node.js: $(node --version)"
+
+            # VS Code serve-web is used as the backend (built into VS Code, no extra install needed)
+            $codeBin = "C:\Program Files\Microsoft VS Code\bin\code.cmd"
+            if (-not (Test-Path $codeBin)) { throw "VS Code not found at $codeBin" }
+            Write-Output "VS Code serve-web backend: $codeBin"
+
+            # Ensure directories
+            if (-not (Test-Path "$VibeDir\logs")) { New-Item -ItemType Directory -Path "$VibeDir\logs" -Force | Out-Null }
+
+            # Install OpenSSL for self-signed cert
+            $opensslPath = Get-Command openssl -ErrorAction SilentlyContinue
+            if (-not $opensslPath) {
+                choco install openssl --yes --no-progress 2>&1 | Out-Null
+                $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
+            }
+            Write-Output "OpenSSL available"
+
+            # Firewall rule
+            $ruleName = "VSCodeWeb-HTTPS-$Port"
+            $existing = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
+            if (-not $existing) {
+                New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Protocol TCP -LocalPort $Port -Action Allow | Out-Null
+            }
+            Write-Output "Firewall: port $Port open"
+
+            # Symlink server extensions to desktop extensions (so serve-web sees all installed extensions)
+            $serverExtDir = "$env:USERPROFILE\.vscode-server\extensions"
+            $desktopExtDir = "$env:USERPROFILE\.vscode\extensions"
+            if (-not (Test-Path $desktopExtDir)) { New-Item -ItemType Directory -Path $desktopExtDir -Force | Out-Null }
+            if ((Get-Item $serverExtDir -ErrorAction SilentlyContinue).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                Write-Output "Extensions symlink already exists"
+            } else {
+                if (Test-Path $serverExtDir) { Remove-Item $serverExtDir -Recurse -Force }
+                $parent = Split-Path $serverExtDir -Parent
+                if (-not (Test-Path $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+                cmd /c mklink /D "$serverExtDir" "$desktopExtDir" | Out-Null
+                Write-Output "Symlinked serve-web extensions -> desktop extensions"
+            }
+
+            # Create startup scripts (PS1 wrappers to avoid cmd.exe issues with special chars)
+            @'
+$logFile = "C:\vscodeweb\logs\codeserver.log"
+& "C:\Program Files\Microsoft VS Code\bin\code.cmd" serve-web --host 127.0.0.1 --port 8080 --without-connection-token *> $logFile
+'@ | Out-File "$VibeDir\start-codeserver.ps1" -Encoding UTF8 -Force
+
+            @"
+`$env:CODESERVER_PORT = "$CodeServerPort"
+`$env:VIBE_PORT = "$Port"
+`$env:VIBE_PASSWORD = "$Password"
+Set-Location "$VibeDir"
+& node server.js *> "$VibeDir\logs\vscodeweb.log"
+"@ | Out-File "$VibeDir\start-vscodeweb.ps1" -Encoding UTF8 -Force
+
+            # Scheduled tasks for auto-start (Password logon = runs without interactive login)
+            $csAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$VibeDir\start-codeserver.ps1`""
+            $csTrigger = New-ScheduledTaskTrigger -AtStartup
+            $csSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+            Register-ScheduledTask -TaskName "VSCodeWeb-Backend" -Action $csAction -Trigger $csTrigger -Settings $csSettings -RunLevel Highest -User "$env:USERNAME" -Password $Password -Force | Out-Null
+
+            $vibeAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$VibeDir\start-vscodeweb.ps1`""
+            $vibeTrigger = New-ScheduledTaskTrigger -AtStartup
+            $vibeSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+            Register-ScheduledTask -TaskName "VSCodeWeb-Proxy" -Action $vibeAction -Trigger $vibeTrigger -Settings $vibeSettings -RunLevel Highest -User "$env:USERNAME" -Password $Password -Force | Out-Null
+
+            Write-Output "VS Code Web services registered (auto-start on boot)"
+        } -ArgumentList $vsCodeWebPw, 9443, 8080
+    }
+
+    # ── 13. Verify all software installed ────────────────────────────────
     Invoke-RemoteStep -Session $session -StepName "Verifying installed software" -Script {
         $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
         $checks = @()
@@ -529,12 +681,16 @@ Write-Host "══════════════════════�
 Write-Host "  Windows 11 Dev VM deployed successfully!" -ForegroundColor Green
 Write-Host ""
 Write-Host "  RDP Address       : $publicIp" -ForegroundColor White
+if($InstallVsCodeWeb) {
+    Write-Host "  VS Code Web       : https://${publicIp}:9443" -ForegroundColor White
+}
 Write-Host "  Username          : $VMUser" -ForegroundColor White
 Write-Host "  Password          : (as provided)" -ForegroundColor White
 Write-Host ""
 Write-Host "  Installed software:" -ForegroundColor White
 Write-Host "    Docker Desktop, Python 3.12, PowerShell 7 + Az + Microsoft.Graph" -ForegroundColor White
 Write-Host "    GitHub CLI + Copilot CLI, Visual Studio Code + extensions (on first login)" -ForegroundColor White
+Write-Host "    VS Code Web (HTTPS proxy with login, auto-starts on boot)" -ForegroundColor White
 Write-Host ""
 Write-Host "  VS Code extensions install automatically on first RDP login." -ForegroundColor Yellow
 Write-Host "════════════════════════════════════════════════════" -ForegroundColor Green

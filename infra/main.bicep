@@ -41,6 +41,19 @@ resource nsg 'Microsoft.Network/networkSecurityGroups@2023-11-01' = {
           destinationAddressPrefix: '*'
         }
       }
+      {
+        name: 'Allow-VSCodeWeb'
+        properties: {
+          priority: 1100
+          direction: 'Inbound'
+          access: 'Allow'
+          protocol: 'Tcp'
+          sourcePortRange: '*'
+          destinationPortRange: '9443'
+          sourceAddressPrefix: '*'
+          destinationAddressPrefix: '*'
+        }
+      }
     ]
   }
 }
