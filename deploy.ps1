@@ -60,6 +60,46 @@ function Write-Step { param([string]$Msg) Write-Host "`n▸ $Msg" -ForegroundCol
 function Write-Ok   { param([string]$Msg) Write-Host "  ✓ $Msg" -ForegroundColor Green }
 function Write-Warn { param([string]$Msg) Write-Host "  ⚠ $Msg" -ForegroundColor Yellow }
 
+function Resolve-VmNetworkResources {
+    <#
+    .SYNOPSIS
+        Resolves NSG name, PIP name, and public IP for an existing VM.
+        Tries convention-based names first, falls back to drilling through NIC/subnet.
+    .OUTPUTS
+        Hashtable with keys: NsgName, PipName, PublicIp
+    #>
+    param(
+        [string]$ResourceGroup,
+        [string]$VMName,
+        [Microsoft.Azure.Commands.Compute.Models.PSVirtualMachine]$VM
+    )
+    $nsgName = "$VMName-nsg"
+    $pipName = "$VMName-pip"
+    $nsgConv = Get-AzNetworkSecurityGroup -ResourceGroupName $ResourceGroup -Name $nsgName -ErrorAction SilentlyContinue
+    $pipConv = Get-AzPublicIpAddress -ResourceGroupName $ResourceGroup -Name $pipName -ErrorAction SilentlyContinue
+    if (-not $nsgConv -or -not $pipConv) {
+        Write-Host "  Convention names not found — resolving via VM network interfaces..." -ForegroundColor Yellow
+        $nicId = $VM.NetworkProfile.NetworkInterfaces[0].Id
+        $nic   = Get-AzNetworkInterface -ResourceId $nicId
+        # PIP from NIC IP configuration
+        $pipId = $nic.IpConfigurations[0].PublicIpAddress.Id
+        if ($pipId) { $pipName = $pipId.Split('/')[-1] }
+        # NSG: check NIC first, then subnet
+        $nsgId = $nic.NetworkSecurityGroup.Id
+        if (-not $nsgId) {
+            $subnetId   = $nic.IpConfigurations[0].Subnet.Id
+            $vnetName   = $subnetId.Split('/')[8]
+            $subnetName = $subnetId.Split('/')[10]
+            $vnet       = Get-AzVirtualNetwork -ResourceGroupName $ResourceGroup -Name $vnetName
+            $subnet     = $vnet.Subnets | Where-Object { $_.Name -eq $subnetName }
+            $nsgId      = $subnet.NetworkSecurityGroup.Id
+        }
+        if ($nsgId) { $nsgName = $nsgId.Split('/')[-1] }
+    }
+    $pipRes   = Get-AzPublicIpAddress -ResourceGroupName $ResourceGroup -Name $pipName -ErrorAction Stop
+    return @{ NsgName = $nsgName; PipName = $pipName; PublicIp = $pipRes.IpAddress }
+}
+
 # Detect whether we can use \r-based spinner animation.
 # Disabled in CI/CD pipelines (where \r produces garbage in build logs)
 # and in hosts that don't expose a cursor (ISE, redirected output, etc.).
@@ -183,12 +223,10 @@ $existingVm = Get-AzVM -ResourceGroupName $ResourceGroup -Name $VMName -ErrorAct
 
 if ($existingVm) {
     Write-Step "VM '$VMName' already exists — skipping Bicep deployment"
-    # Derive resource names using same convention as Bicep
-    $nsgName  = "$VMName-nsg"
-    $pipName  = "$VMName-pip"
-    $pipRes   = Get-AzPublicIpAddress -ResourceGroupName $ResourceGroup -Name $pipName -ErrorAction Stop
-    $publicIp = $pipRes.IpAddress
-    Write-Ok "Public IP: $publicIp"
+    $resolved = Resolve-VmNetworkResources -ResourceGroup $ResourceGroup -VMName $VMName -VM $existingVm
+    $nsgName  = $resolved.NsgName
+    $publicIp = $resolved.PublicIp
+    Write-Ok "Resolved: NSG=$nsgName  PIP=$($resolved.PipName)  IP=$publicIp"
 } else {
     Write-Step "Deploying infrastructure (Bicep)"
     $bicepPath = Join-Path $InfraPath "main.bicep"
