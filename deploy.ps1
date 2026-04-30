@@ -794,7 +794,9 @@ Write-Host ""
 Write-Host "  Installed software:" -ForegroundColor White
 Write-Host "    Docker Desktop, Python 3.12, PowerShell 7 + Az + Microsoft.Graph" -ForegroundColor White
 Write-Host "    GitHub CLI + Copilot CLI, Visual Studio Code + extensions (on first login)" -ForegroundColor White
-Write-Host "    VS Code Web (HTTPS proxy with login, auto-starts on boot)" -ForegroundColor White
+if($InstallVsCodeWeb) {
+    Write-Host "    VS Code Web (HTTPS proxy with login, auto-starts on boot)" -ForegroundColor White
+}
 Write-Host ""
 Write-Host "  VS Code extensions install automatically on first RDP login." -ForegroundColor Yellow
 Write-Host "════════════════════════════════════════════════════" -ForegroundColor Green
