@@ -164,6 +164,9 @@ Write-Host "  VM Name        : $VMName"            -ForegroundColor White
 Write-Host "  VM Size        : $VMSize"            -ForegroundColor White
 Write-Host "  Admin User     : $VMUser"            -ForegroundColor White
 
+# ── Start overall deployment timer ───────────────────────────────────────────
+$deployStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
 # ── Resource Group ───────────────────────────────────────────────────────────
 Write-Step "Ensuring resource group '$ResourceGroup' in '$Location'"
 $rg = Get-AzResourceGroup -Name $ResourceGroup -ErrorAction SilentlyContinue
@@ -234,9 +237,9 @@ if ($existingRule) {
 # ── Establish PS Remoting session ────────────────────────────────────────────
 Write-Step "Connecting to VM via PowerShell Remoting (WinRM HTTPS)"
 $credential = [PSCredential]::new($VMUser, $securePassword)
-$sessionOpts = New-PSSessionOption -SkipCACheck -SkipCNCheck -SkipRevocationCheck -OpenTimeout 120000 -OperationTimeout 600000
+$connectSessionOpts = New-PSSessionOption -SkipCACheck -SkipCNCheck -SkipRevocationCheck -OpenTimeout 10000 -OperationTimeout 600000
 
-$maxRetries = 12
+$maxRetries = 30
 $retryDelay = 15
 $spinner = @('⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏')
 $spinIdx = 0
@@ -244,7 +247,7 @@ $session = $null
 for ($i = 1; $i -le $maxRetries; $i++) {
     try {
         $session = New-PSSession -ComputerName $publicIp -Credential $credential `
-            -UseSSL -SessionOption $sessionOpts -ErrorAction Stop
+            -UseSSL -SessionOption $connectSessionOpts -ErrorAction Stop
         break
     } catch {
         if ($i -eq $maxRetries) {
@@ -280,21 +283,106 @@ try {
     }
 
     # ── 2. Enable Windows features (WSL2, Hyper-V, Containers) ───────────
-    Invoke-RemoteStep -Session $session -StepName "Enabling Windows features (WSL2, Hyper-V, Containers)" -Script {
-        Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Windows-Subsystem-Linux -NoRestart -All | Out-Null
+    $needsReboot = Invoke-Command -Session $session -ScriptBlock {
+        $reboot = $false
+        $r = Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Windows-Subsystem-Linux -NoRestart -All
+        if ($r.RestartNeeded) { $reboot = $true }
         Write-Output "WSL enabled"
-        Enable-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform -NoRestart -All | Out-Null
+        $r = Enable-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform -NoRestart -All
+        if ($r.RestartNeeded) { $reboot = $true }
         Write-Output "VirtualMachinePlatform enabled"
         try {
-            Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All -NoRestart -All | Out-Null
+            $r = Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All -NoRestart -All
+            if ($r.RestartNeeded) { $reboot = $true }
             Write-Output "Hyper-V enabled"
         } catch {
             Write-Output "Hyper-V not available on this SKU — WSL2 backend will be used"
         }
-        Enable-WindowsOptionalFeature -Online -FeatureName Containers -NoRestart -All | Out-Null
+        $r = Enable-WindowsOptionalFeature -Online -FeatureName Containers -NoRestart -All
+        if ($r.RestartNeeded) { $reboot = $true }
         Write-Output "Containers feature enabled"
-        wsl --update 2>&1 | ForEach-Object { Write-Output $_ }
-        Write-Output "WSL updated"
+        return $reboot
+    } 2>&1
+    # Last value returned is the boolean; preceding lines are output strings
+    $featuresRebootNeeded = $needsReboot | Select-Object -Last 1
+    $featOutput = $needsReboot | Select-Object -SkipLast 1
+    Write-Host "  ┌─ Enabling Windows features (WSL2, Hyper-V, Containers)…" -ForegroundColor DarkCyan
+    foreach ($line in $featOutput) {
+        $text = "$line".Trim()
+        if ($text) { Write-Host "  │  $text" -ForegroundColor DarkGray }
+    }
+    Write-Host "  └─ Enabling Windows features ✓" -ForegroundColor Green
+
+    # If features were newly enabled, reboot to activate them before WSL setup
+    if ($featuresRebootNeeded -eq $true) {
+        Write-Step "Rebooting VM to activate Windows features"
+        Remove-PSSession -Session $session -ErrorAction SilentlyContinue
+        Restart-AzVM -ResourceGroupName $ResourceGroup -Name $VMName | Out-Null
+        Write-Ok "VM restarted — waiting for WinRM to come back"
+
+        # Re-establish session after reboot
+        Start-Sleep -Seconds 15
+        $session = $null
+        for ($i = 1; $i -le $maxRetries; $i++) {
+            try {
+                $session = New-PSSession -ComputerName $publicIp -Credential $credential `
+                    -UseSSL -SessionOption $connectSessionOpts -ErrorAction Stop
+                break
+            } catch {
+                if ($i -eq $maxRetries) {
+                    Write-Error "Failed to reconnect after reboot ($maxRetries attempts): $_"
+                }
+                if ($script:CanAnimateSpinner) {
+                    $tickCount = [math]::Floor($retryDelay * 1000 / 150)
+                    for ($tick = 0; $tick -lt $tickCount; $tick++) {
+                        $s = $spinner[$spinIdx % $spinner.Count]; $spinIdx++
+                        $elapsed = ($i - 1) * $retryDelay + [math]::Floor($tick * 150 / 1000)
+                        Write-Host "`r  $s Reconnecting… attempt $i/$maxRetries (${elapsed}s)   " -NoNewline -ForegroundColor DarkGray
+                        Start-Sleep -Milliseconds 150
+                    }
+                } else {
+                    Write-Host "  │  Reconnect attempt $i/$maxRetries — retrying in ${retryDelay}s…" -ForegroundColor DarkGray
+                    Start-Sleep -Seconds $retryDelay
+                }
+            }
+        }
+        if ($script:CanAnimateSpinner) { Write-Host "`r$(' ' * 70)`r" -NoNewline }
+        Write-Ok "Reconnected after reboot"
+    }
+
+    # ── 2b. Complete WSL setup (requires features active after reboot) ────
+    Invoke-RemoteStep -Session $session -StepName "Installing WSL" -Script {
+        # Check if WSL is already properly installed. Try the MSI-installed path first,
+        # then fall back to the system wsl.exe (which may work outside session 0).
+        $wslExe = "$env:ProgramFiles\WSL\wsl.exe"
+        if (-not (Test-Path $wslExe)) { $wslExe = "$env:SystemRoot\System32\wsl.exe" }
+        if (Test-Path $wslExe) {
+            # wsl.exe outputs UTF-16LE which gets embedded NUL chars in WinRM sessions
+            $wslVer = (& $wslExe --version 2>&1 | Select-Object -First 1) -replace '\x00',''
+            if ($LASTEXITCODE -eq 0 -and $wslVer -match 'WSL') {
+                Write-Output "WSL already installed: $wslVer"
+                return
+            }
+        }
+
+        # DO NOT replace this with "wsl --install". The in-box wsl.exe is just a stub
+        # that launches the Microsoft Store / AppInstaller — which silently fails in
+        # WinRM session 0 (non-interactive). The --web-download flag doesn't help either.
+        # The only reliable method is the official MSI from the GitHub releases page.
+        $wslMsi = "$env:TEMP\wsl.msi"
+        $release = Invoke-RestMethod -Uri "https://api.github.com/repos/microsoft/WSL/releases/latest" -UseBasicParsing
+        $asset = $release.assets | Where-Object { $_.name -match '\.x64\.msi$' } | Select-Object -First 1
+        if (-not $asset) { throw "Could not find x64 MSI in latest WSL release ($($release.tag_name))" }
+        $wslUrl = $asset.browser_download_url
+        Write-Output "Downloading WSL $($release.tag_name) MSI…"
+        Invoke-WebRequest -Uri $wslUrl -OutFile $wslMsi -UseBasicParsing
+        $proc = Start-Process msiexec.exe -ArgumentList "/i `"$wslMsi`" /quiet /norestart" -Wait -PassThru -NoNewWindow
+        if ($proc.ExitCode -ne 0) { throw "WSL MSI install failed with exit code $($proc.ExitCode)" }
+        Remove-Item $wslMsi -Force -ErrorAction SilentlyContinue
+        wsl --update 2>&1 | Out-Null
+        wsl --set-default-version 2 2>&1 | Out-Null
+        $ver = (wsl --version 2>&1 | Select-Object -First 1) -replace '\x00',''
+        Write-Output "WSL installed: $ver"
     }
 
     # ── 3. Install Python ────────────────────────────────────────────────
@@ -368,7 +456,7 @@ try {
         if (Test-Path $codePath) { Write-Output "VS Code installed" }
     }
 
-    # ── 6b. Install Git ─────────────────────────────────────────────────
+    # ── 6a. Install Git ─────────────────────────────────────────────────
     Invoke-RemoteStep -Session $session -StepName "Installing Git" -Script {
         $ProgressPreference = 'SilentlyContinue'
         $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
@@ -376,7 +464,7 @@ try {
         if ($gitCheck) {
             Write-Output "Git already installed: $(git --version)"
         } else {
-            winget install --id Git.Git -e --silent --accept-package-agreements --accept-source-agreements 2>&1 | Out-Null
+            choco install git --yes --no-progress 2>&1 | Select-String -Pattern '(install|downloaded|The install)' | ForEach-Object { Write-Output $_.Line.Trim() }
             $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
             Write-Output "$(git --version) installed"
         }
@@ -390,15 +478,11 @@ try {
         $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
         $ghVer = & gh --version 2>&1 | Select-Object -First 1
         Write-Output "$ghVer installed"
-        # Install GitHub Copilot CLI (standalone) via winget
-        $wingetCheck = winget list --id GitHub.Copilot --accept-source-agreements 2>&1 | Out-String
-        if ($wingetCheck -match 'GitHub.Copilot') {
-            Write-Output "GitHub Copilot CLI already installed"
-        } else {
-            winget install GitHub.Copilot --accept-source-agreements --accept-package-agreements --silent 2>&1 | ForEach-Object { Write-Output $_ }
-            Write-Output "GitHub Copilot CLI installed"
-        }
+        # Install GitHub Copilot CLI via Chocolatey (standalone copilot.exe)
+        choco install github-copilot-cli --yes --no-progress 2>&1 | Select-String -Pattern '(install|downloaded|The install)' | ForEach-Object { Write-Output $_.Line.Trim() }
         $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
+        $copilotVer = & copilot.exe --version 2>&1 | Select-Object -First 1
+        Write-Output "Copilot CLI: $copilotVer"
     }
 
     # ── 8. Install Az PowerShell module ──────────────────────────────────
@@ -406,16 +490,26 @@ try {
         $pwshExe = "C:\Program Files\PowerShell\7\pwsh.exe"
         if (Test-Path $pwshExe) {
             & $pwshExe -NoProfile -Command {
+                $existing = Get-InstalledModule Az -ErrorAction SilentlyContinue
+                if ($existing) {
+                    Write-Output "Az module $($existing.Version) already installed — skipping"
+                    return
+                }
                 $ProgressPreference = 'SilentlyContinue'
                 Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
                 Install-Module -Name Az -Force -AllowClobber -Scope AllUsers
                 Write-Output "Az module $((Get-InstalledModule Az).Version) installed"
             }
         } else {
-            Write-Output "pwsh 7 not found — installing Az in Windows PowerShell"
-            Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
-            Install-Module -Name Az -Force -AllowClobber -Scope AllUsers
-            Write-Output "Az module installed"
+            $existing = Get-InstalledModule Az -ErrorAction SilentlyContinue
+            if ($existing) {
+                Write-Output "Az module $($existing.Version) already installed — skipping"
+            } else {
+                Write-Output "pwsh 7 not found — installing Az in Windows PowerShell"
+                Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+                Install-Module -Name Az -Force -AllowClobber -Scope AllUsers
+                Write-Output "Az module installed"
+            }
         }
     }
 
@@ -424,16 +518,26 @@ try {
         $pwshExe = "C:\Program Files\PowerShell\7\pwsh.exe"
         if (Test-Path $pwshExe) {
             & $pwshExe -NoProfile -Command {
+                $existing = Get-InstalledModule Microsoft.Graph -ErrorAction SilentlyContinue
+                if ($existing) {
+                    Write-Output "Microsoft.Graph module $($existing.Version) already installed — skipping"
+                    return
+                }
                 $ProgressPreference = 'SilentlyContinue'
                 Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
                 Install-Module -Name Microsoft.Graph -Force -AllowClobber -Scope AllUsers
                 Write-Output "Microsoft.Graph module $((Get-InstalledModule Microsoft.Graph).Version) installed"
             }
         } else {
-            Write-Output "pwsh 7 not found — installing Microsoft.Graph in Windows PowerShell"
-            Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
-            Install-Module -Name Microsoft.Graph -Force -AllowClobber -Scope AllUsers
-            Write-Output "Microsoft.Graph module installed"
+            $existing = Get-InstalledModule Microsoft.Graph -ErrorAction SilentlyContinue
+            if ($existing) {
+                Write-Output "Microsoft.Graph module $($existing.Version) already installed — skipping"
+            } else {
+                Write-Output "pwsh 7 not found — installing Microsoft.Graph in Windows PowerShell"
+                Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+                Install-Module -Name Microsoft.Graph -Force -AllowClobber -Scope AllUsers
+                Write-Output "Microsoft.Graph module installed"
+            }
         }
     }
 
@@ -456,7 +560,6 @@ $extensions = @(
     "GitHub.copilot-chat"
     "ms-python.python"
     "ms-python.debugpy"
-    "ms-vscode.azure-account"
     "ms-azuretools.vscode-azureresourcegroups"
     "ms-azuretools.vscode-azurefunctions"
     "ms-vscode.powershell"
@@ -470,11 +573,7 @@ $extensions = @(
 foreach ($ext in $extensions) {
     & $codePath --install-extension $ext --force 2>&1 | Out-Null
 }
-# Install gh-copilot extension (requires interactive user session)
-$ghPath = (Get-Command gh -ErrorAction SilentlyContinue).Source
-if ($ghPath) {
-    & gh extension install github/gh-copilot --force 2>&1 | Out-Null
-}
+
 Unregister-ScheduledTask -TaskName "InstallVSCodeExtensions" -Confirm:$false -ErrorAction SilentlyContinue
 '@
         $extensionsScript | Out-File -FilePath "$setupDir\install-extensions.ps1" -Encoding UTF8 -Force
@@ -627,9 +726,8 @@ Set-Location "$VibeDir"
         $ghVer = & gh --version 2>&1 | Select-Object -First 1
         if ($LASTEXITCODE -eq 0) { $checks += "OK  GitHub CLI: $ghVer" } else { $checks += "FAIL GitHub CLI not found" }
         # GitHub Copilot CLI (standalone)
-        $copilotCheck = winget list --id GitHub.Copilot --accept-source-agreements 2>&1 | Out-String
-        if ($copilotCheck -match 'GitHub.Copilot') { $checks += "OK  GitHub Copilot CLI installed" } else { $checks += "FAIL GitHub Copilot CLI not found" }
-        $checks += "OK  gh-copilot extension scheduled for first login"
+        $copilotVer = & copilot.exe --version 2>&1 | Select-Object -First 1
+        if ($LASTEXITCODE -eq 0) { $checks += "OK  Copilot CLI: $copilotVer" } else { $checks += "FAIL Copilot CLI (copilot.exe) not found" }
         # Az module
         if (Test-Path $pwshExe) {
             $azVer = & $pwshExe -NoProfile -Command '(Get-InstalledModule Az -ErrorAction SilentlyContinue).Version'
@@ -643,13 +741,19 @@ Set-Location "$VibeDir"
         # Chocolatey
         $chocoVer = & choco --version 2>&1
         if ($LASTEXITCODE -eq 0) { $checks += "OK  Chocolatey: $chocoVer" } else { $checks += "FAIL Chocolatey not found" }
+        # WSL
+        $wslExe = "$env:SystemRoot\System32\wsl.exe"
+        if (Test-Path $wslExe) {
+            $wslVersion = (& $wslExe --version 2>&1 | Select-Object -First 1) -replace '\x00',''
+            if ($LASTEXITCODE -eq 0 -and $wslVersion) { $checks += "OK  WSL: $wslVersion" } else { $checks += "OK  WSL installed (version check requires reboot)" }
+        } else { $checks += "FAIL WSL not installed" }
         # Scheduled task for extensions
         $task = Get-ScheduledTask -TaskName "InstallVSCodeExtensions" -ErrorAction SilentlyContinue
         if ($task) { $checks += "OK  VS Code extensions scheduled task registered" } else { $checks += "FAIL Extensions task not found" }
 
         foreach ($c in $checks) { Write-Output $c }
         $failures = $checks | Where-Object { $_ -match '^FAIL' }
-        if ($failures) { Write-Output "`n$($failures.Count) check(s) FAILED" } else { Write-Output "`nAll checks passed" }
+        if ($failures) { Write-Error "$($failures.Count) check(s) FAILED" } else { Write-Output "`nAll checks passed" }
     }
 
 } finally {
@@ -671,7 +775,7 @@ try {
 }
 
 # ── Restart VM ───────────────────────────────────────────────────────────────
-Write-Step "Restarting VM to finalize Docker/WSL2 setup"
+Write-Step "Restarting VM to finalize Docker setup"
 Restart-AzVM -ResourceGroupName $ResourceGroup -Name $VMName | Out-Null
 Write-Ok "VM restarted"
 
@@ -741,3 +845,12 @@ if ($OpenMstsc) {
         Write-Ok "mstsc started"
     }
 }
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+$deployStopwatch.Stop()
+$totalMin = [math]::Floor($deployStopwatch.Elapsed.TotalMinutes)
+$totalSec = $deployStopwatch.Elapsed.Seconds
+Write-Host ""
+Write-Host "══════════════════════════════════════════════════════════════" -ForegroundColor Cyan
+Write-Host "  Deployment completed in ${totalMin}m ${totalSec}s" -ForegroundColor Cyan
+Write-Host "══════════════════════════════════════════════════════════════" -ForegroundColor Cyan
