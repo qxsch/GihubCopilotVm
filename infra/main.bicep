@@ -17,6 +17,12 @@ param vmSize string = 'Standard_D4s_v5'
 @description('Windows 11 image SKU')
 param imageSku string = 'win11-24h2-pro'
 
+@description('Enable public IP address on the VM')
+param enablePublicIp bool = true
+
+@description('Resource ID of an existing VNet to peer with. Leave empty to skip peering.')
+param peerVnetId string = ''
+
 var vnetName = '${vmName}-vnet'
 var subnetName = 'default'
 var nsgName = '${vmName}-nsg'
@@ -81,7 +87,7 @@ resource vnet 'Microsoft.Network/virtualNetworks@2023-11-01' = {
   }
 }
 
-resource publicIp 'Microsoft.Network/publicIPAddresses@2023-11-01' = {
+resource publicIp 'Microsoft.Network/publicIPAddresses@2023-11-01' = if (enablePublicIp) {
   name: publicIpName
   location: location
   sku: {
@@ -103,9 +109,9 @@ resource nic 'Microsoft.Network/networkInterfaces@2023-11-01' = {
           subnet: {
             id: vnet.properties.subnets[0].id
           }
-          publicIPAddress: {
+          publicIPAddress: enablePublicIp ? {
             id: publicIp.id
-          }
+          } : null
           privateIPAllocationMethod: 'Dynamic'
         }
       }
@@ -178,8 +184,25 @@ resource winrmExtension 'Microsoft.Compute/virtualMachines/extensions@2024-03-01
   }
 }
 
+// Peering from spoke VNet to hub VNet (use hub's VPN gateway)
+resource peeringToHub 'Microsoft.Network/virtualNetworks/virtualNetworkPeerings@2023-11-01' = if (!empty(peerVnetId)) {
+  parent: vnet
+  name: 'peer-to-hub'
+  properties: {
+    remoteVirtualNetwork: {
+      id: peerVnetId
+    }
+    allowVirtualNetworkAccess: true
+    allowForwardedTraffic: true
+    allowGatewayTransit: false
+    useRemoteGateways: true
+  }
+}
+
 output vmName string = vm.name
-output publicIpAddress string = publicIp.properties.ipAddress
+output publicIpAddress string = enablePublicIp ? publicIp.properties.ipAddress : ''
+output privateIpAddress string = nic.properties.ipConfigurations[0].properties.privateIPAddress
 output adminUsername string = adminUsername
 output nsgName string = nsg.name
+output vnetId string = vnet.id
 

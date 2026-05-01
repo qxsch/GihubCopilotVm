@@ -39,6 +39,12 @@ param(
     [Parameter(HelpMessage = "Launch mstsc with the generated .rdp profile after deployment")]
     [switch]$OpenMstsc,
 
+    [Parameter(HelpMessage = "Resource ID of hub VNet to peer with (for VPN gateway access)")]
+    [string]$HubVnetId = "",
+
+    [Parameter(HelpMessage = "Disable public IP on the VM (use private IP via VPN instead)")]
+    [switch]$DisablePublicIp,
+
     [Parameter(HelpMessage = "Deploy VS Code Web interface (HTTPS proxy with login)")]
     [switch]$InstallVsCodeWeb,
 
@@ -60,6 +66,46 @@ function Write-Step { param([string]$Msg) Write-Host "`n▸ $Msg" -ForegroundCol
 function Write-Ok   { param([string]$Msg) Write-Host "  ✓ $Msg" -ForegroundColor Green }
 function Write-Warn { param([string]$Msg) Write-Host "  ⚠ $Msg" -ForegroundColor Yellow }
 
+function Invoke-InSubscription {
+    <#
+    .SYNOPSIS
+        Executes a script block in the context of a different Azure subscription,
+        then restores the original subscription. No-op if already in that subscription.
+    .PARAMETER SubscriptionId
+        The subscription GUID to switch to.
+    .PARAMETER ResourceId
+        An Azure resource ID — the subscription is extracted automatically.
+    #>
+    param(
+        [Parameter(Mandatory, ParameterSetName = 'BySub')]
+        [string]$SubscriptionId,
+
+        [Parameter(Mandatory, ParameterSetName = 'ByResource')]
+        [string]$ResourceId,
+
+        [Parameter(Mandatory)][scriptblock]$ScriptBlock
+    )
+    if ($PSCmdlet.ParameterSetName -eq 'ByResource') {
+        if ($ResourceId -notmatch '^/subscriptions/[0-9a-f]{8}-([0-9a-f]{4}-){3}[0-9a-f]{12}/') {
+            throw "Invalid ResourceId: expected format /subscriptions/{guid}/... — got: $ResourceId"
+        }
+        $SubscriptionId = ($ResourceId -split '/')[2]
+    }
+    $private:__invSub_originalId = (Get-AzContext).Subscription.Id
+    $private:__invSub_switched = $false
+    try {
+        if ($SubscriptionId -ne $__invSub_originalId) {
+            Set-AzContext -SubscriptionId $SubscriptionId -Scope Process | Out-Null
+            $__invSub_switched = $true
+        }
+        & $ScriptBlock
+    } finally {
+        if ($__invSub_switched) {
+            Set-AzContext -SubscriptionId $__invSub_originalId -Scope Process | Out-Null
+        }
+    }
+}
+
 function Resolve-VmNetworkResources {
     <#
     .SYNOPSIS
@@ -75,6 +121,7 @@ function Resolve-VmNetworkResources {
     )
     $nsgName = "$VMName-nsg"
     $pipName = "$VMName-pip"
+    $pipId = $null
     $nsgConv = Get-AzNetworkSecurityGroup -ResourceGroupName $ResourceGroup -Name $nsgName -ErrorAction SilentlyContinue
     $pipConv = Get-AzPublicIpAddress -ResourceGroupName $ResourceGroup -Name $pipName -ErrorAction SilentlyContinue
     if (-not $nsgConv -or -not $pipConv) {
@@ -96,8 +143,19 @@ function Resolve-VmNetworkResources {
         }
         if ($nsgId) { $nsgName = $nsgId.Split('/')[-1] }
     }
-    $pipRes   = Get-AzPublicIpAddress -ResourceGroupName $ResourceGroup -Name $pipName -ErrorAction Stop
-    return @{ NsgName = $nsgName; PipName = $pipName; PublicIp = $pipRes.IpAddress }
+    if ($pipConv -or ($pipId -and $pipId -ne '')) {
+        $pipRes = Get-AzPublicIpAddress -ResourceGroupName $ResourceGroup -Name $pipName -ErrorAction SilentlyContinue
+        $ip = if ($pipRes) { $pipRes.IpAddress } else { $null }
+    } else {
+        $ip = $null
+    }
+    # Fall back to private IP if no public IP
+    if (-not $ip) {
+        $nicId = $VM.NetworkProfile.NetworkInterfaces[0].Id
+        $nicObj = Get-AzNetworkInterface -ResourceId $nicId
+        $ip = $nicObj.IpConfigurations[0].PrivateIpAddress
+    }
+    return @{ NsgName = $nsgName; PipName = $pipName; ConnectIp = $ip }
 }
 
 # Detect whether we can use \r-based spinner animation.
@@ -225,8 +283,8 @@ if ($existingVm) {
     Write-Step "VM '$VMName' already exists — skipping Bicep deployment"
     $resolved = Resolve-VmNetworkResources -ResourceGroup $ResourceGroup -VMName $VMName -VM $existingVm
     $nsgName  = $resolved.NsgName
-    $publicIp = $resolved.PublicIp
-    Write-Ok "Resolved: NSG=$nsgName  PIP=$($resolved.PipName)  IP=$publicIp"
+    $publicIp = $resolved.ConnectIp
+    Write-Ok "Resolved: NSG=$nsgName  IP=$publicIp"
 } else {
     Write-Step "Deploying infrastructure (Bicep)"
     $bicepPath = Join-Path $InfraPath "main.bicep"
@@ -234,42 +292,83 @@ if ($existingVm) {
         Write-Error "Bicep file not found at $bicepPath"
     }
 
-    $deployment = New-AzResourceGroupDeployment `
-        -ResourceGroupName $ResourceGroup `
-        -Name "deploy-$VMName-$(Get-Date -Format 'yyyyMMdd-HHmmss')" `
-        -TemplateFile $bicepPath `
-        -vmName $VMName `
-        -adminUsername $VMUser `
-        -adminPassword $securePassword `
-        -vmSize $VMSize `
-        -location $Location
+    $bicepParams = @{
+        ResourceGroupName = $ResourceGroup
+        Name              = "deploy-$VMName-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+        TemplateFile      = $bicepPath
+        vmName            = $VMName
+        adminUsername     = $VMUser
+        adminPassword     = $securePassword
+        vmSize            = $VMSize
+        location          = $Location
+    }
+    if ($HubVnetId) {
+        $bicepParams['peerVnetId'] = $HubVnetId
+    }
+    if ($DisablePublicIp) {
+        $bicepParams['enablePublicIp'] = $false
+    }
+    $deployment = New-AzResourceGroupDeployment @bicepParams
 
-    $publicIp = $deployment.Outputs.publicIpAddress.Value
-    $nsgName  = $deployment.Outputs.nsgName.Value
-    Write-Ok "VM deployed"
-    Write-Ok "Public IP: $publicIp"
+    $nsgName = $deployment.Outputs.nsgName.Value
+    if ($DisablePublicIp) {
+        $publicIp = $deployment.Outputs.privateIpAddress.Value
+        Write-Ok "VM deployed (no public IP — using private IP via VPN)"
+        Write-Ok "Private IP: $publicIp"
+    } else {
+        $publicIp = $deployment.Outputs.publicIpAddress.Value
+        Write-Ok "VM deployed"
+        Write-Ok "Public IP: $publicIp"
+    }
+
+    # ── Hub → Spoke peering (allowGatewayTransit) ────────────────────────
+    if ($HubVnetId) {
+        $spokeVnetId = $deployment.Outputs.vnetId.Value
+        $hubRg = ($HubVnetId -split '/')[4]
+        $hubVnetName = ($HubVnetId -split '/')[-1]
+        $spokeName = ($spokeVnetId -split '/')[-1]
+        $peeringName = "peer-to-$spokeName"
+
+        Invoke-InSubscription -ResourceId $HubVnetId -ScriptBlock {
+            $existingPeering = Get-AzVirtualNetworkPeering -ResourceGroupName $hubRg -VirtualNetworkName $hubVnetName -Name $peeringName -ErrorAction SilentlyContinue
+            if (-not $existingPeering) {
+                Write-Step "Creating hub → spoke peering ($hubVnetName → $spokeName)"
+                Add-AzVirtualNetworkPeering -ResourceGroupName $hubRg -VirtualNetworkName $hubVnetName `
+                    -Name $peeringName -RemoteVirtualNetworkId $spokeVnetId `
+                    -AllowGatewayTransit -AllowForwardedTraffic | Out-Null
+                Write-Ok "Peering '$peeringName' created with AllowGatewayTransit"
+            } else {
+                Write-Ok "Hub → spoke peering '$peeringName' already exists"
+            }
+        }
+    }
 }
 
 # ── Temporary WinRM NSG rule (idempotent) ────────────────────────────────────
-Write-Step "Adding temporary WinRM HTTPS rule (removed after setup)"
 $winrmRuleName = 'Allow-WinRM-HTTPS-Temp'
-$nsg = Get-AzNetworkSecurityGroup -ResourceGroupName $ResourceGroup -Name $nsgName
-$existingRule = $nsg.SecurityRules | Where-Object { $_.Name -eq $winrmRuleName }
-if ($existingRule) {
-    Write-Ok "WinRM rule already exists — skipping"
+if (-not $DisablePublicIp) {
+    Write-Step "Adding temporary WinRM HTTPS rule (removed after setup)"
+    $nsg = Get-AzNetworkSecurityGroup -ResourceGroupName $ResourceGroup -Name $nsgName
+    $existingRule = $nsg.SecurityRules | Where-Object { $_.Name -eq $winrmRuleName }
+    if ($existingRule) {
+        Write-Ok "WinRM rule already exists — skipping"
+    } else {
+        $nsg | Add-AzNetworkSecurityRuleConfig `
+            -Name $winrmRuleName `
+            -Priority 1010 `
+            -Direction Inbound `
+            -Access Allow `
+            -Protocol Tcp `
+            -SourcePortRange '*' `
+            -DestinationPortRange '5986' `
+            -SourceAddressPrefix '*' `
+            -DestinationAddressPrefix '*' `
+        | Set-AzNetworkSecurityGroup | Out-Null
+        Write-Ok "WinRM rule added (will be removed after setup)"
+    }
 } else {
-    $nsg | Add-AzNetworkSecurityRuleConfig `
-        -Name $winrmRuleName `
-        -Priority 1010 `
-        -Direction Inbound `
-        -Access Allow `
-        -Protocol Tcp `
-        -SourcePortRange '*' `
-        -DestinationPortRange '5986' `
-        -SourceAddressPrefix '*' `
-        -DestinationAddressPrefix '*' `
-    | Set-AzNetworkSecurityGroup | Out-Null
-    Write-Ok "WinRM rule added (will be removed after setup)"
+    Write-Step "Skipping temporary WinRM NSG rule (private connectivity via VPN)"
+    Write-Ok "Not needed — VM accessed via private IP"
 }
 
 # ── Establish PS Remoting session ────────────────────────────────────────────
@@ -802,14 +901,16 @@ Set-Location "$VibeDir"
 }
 
 # ── Remove temporary WinRM NSG rule ──────────────────────────────────────────
-Write-Step "Removing temporary WinRM HTTPS rule"
-try {
-    Get-AzNetworkSecurityGroup -ResourceGroupName $ResourceGroup -Name $nsgName `
-        | Remove-AzNetworkSecurityRuleConfig -Name $winrmRuleName `
-        | Set-AzNetworkSecurityGroup | Out-Null
-    Write-Ok "WinRM rule removed"
-} catch {
-    Write-Warn "Could not remove WinRM rule '$winrmRuleName' — clean up manually"
+if (-not $DisablePublicIp) {
+    Write-Step "Removing temporary WinRM HTTPS rule"
+    try {
+        Get-AzNetworkSecurityGroup -ResourceGroupName $ResourceGroup -Name $nsgName `
+            | Remove-AzNetworkSecurityRuleConfig -Name $winrmRuleName `
+            | Set-AzNetworkSecurityGroup | Out-Null
+        Write-Ok "WinRM rule removed"
+    } catch {
+        Write-Warn "Could not remove WinRM rule '$winrmRuleName' — clean up manually"
+    }
 }
 
 # ── Restart VM ───────────────────────────────────────────────────────────────
