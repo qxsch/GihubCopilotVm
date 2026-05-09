@@ -12,19 +12,32 @@ const crypto = require('crypto');
 const CODESERVER_PORT = parseInt(process.env.CODESERVER_PORT || '8080', 10);
 const VIBE_PORT = parseInt(process.env.VIBE_PORT || '9443', 10);
 const VIBE_PASSWORD = process.env.VIBE_PASSWORD || '';
+const VIBE_CERT = process.env.VIBE_CERT || '';
+const VIBE_KEY = process.env.VIBE_KEY || '';
+const VIBE_HOST = process.env.VIBE_HOST || 'localhost';
 const CERT_DIR = path.join(__dirname, 'certs');
 
 // ─── Self-signed cert generation ─────────────────────────────────────────────
 function ensureCerts() {
+  // Use environment variables if provided (for ACME certificates)
+  if (VIBE_CERT && VIBE_KEY) {
+    if (fs.existsSync(VIBE_CERT) && fs.existsSync(VIBE_KEY)) {
+      console.log(`[VibeCoding] Using ACME certificate: ${VIBE_CERT}`);
+      return { key: fs.readFileSync(VIBE_KEY), cert: fs.readFileSync(VIBE_CERT) };
+    }
+  }
+
   if (!fs.existsSync(CERT_DIR)) fs.mkdirSync(CERT_DIR, { recursive: true });
   const keyPath = path.join(CERT_DIR, 'key.pem');
   const certPath = path.join(CERT_DIR, 'cert.pem');
   if (fs.existsSync(keyPath) && fs.existsSync(certPath)) {
+    console.log(`[VibeCoding] Using existing self-signed certificate`);
     return { key: fs.readFileSync(keyPath), cert: fs.readFileSync(certPath) };
   }
   const { execSync } = require('child_process');
+  console.log(`[VibeCoding] Generating self-signed certificate for ${VIBE_HOST}`);
   execSync(
-    `openssl req -x509 -newkey rsa:2048 -keyout "${keyPath}" -out "${certPath}" -days 365 -nodes -subj "/CN=vibecoding"`,
+    `openssl req -x509 -newkey rsa:2048 -keyout "${keyPath}" -out "${certPath}" -days 365 -nodes -subj "/CN=${VIBE_HOST}"`,
     { stdio: 'pipe' }
   );
   return { key: fs.readFileSync(keyPath), cert: fs.readFileSync(certPath) };
@@ -124,29 +137,46 @@ function handleUpgrade(req, socket, head) {
     headers: { ...req.headers },
   };
 
+  console.log(`[ws] upgrade ${req.url.split('?')[0]}`);
   const proxyReq = http.request(options);
+
+  proxyReq.on('response', (proxyRes) => {
+    console.error(`[ws] backend responded ${proxyRes.statusCode} instead of 101`);
+    socket.write(`HTTP/1.1 ${proxyRes.statusCode} ${proxyRes.statusMessage}\r\n\r\n`);
+    socket.destroy();
+  });
+
   proxyReq.on('upgrade', (proxyRes, proxySocket, proxyHead) => {
+    console.log(`[ws] upgrade OK, piping`);
     proxySocket.setKeepAlive(true, 30000);
     proxySocket.setNoDelay(true);
     proxySocket.setTimeout(0);
 
+    // Use rawHeaders to preserve duplicate Set-Cookie headers (arrays get
+    // mangled into a single comma-joined line by Object.entries, which is
+    // invalid for Set-Cookie and breaks the vsda handshake cookie chain).
+    const headerLines = [];
+    for (let i = 0; i < proxyRes.rawHeaders.length; i += 2) {
+      headerLines.push(`${proxyRes.rawHeaders[i]}: ${proxyRes.rawHeaders[i + 1]}`);
+    }
     socket.write(
       'HTTP/1.1 101 Switching Protocols\r\n' +
-      Object.entries(proxyRes.headers).map(([k, v]) => `${k}: ${v}`).join('\r\n') +
+      headerLines.join('\r\n') +
       '\r\n\r\n'
     );
     if (proxyHead.length) proxySocket.unshift(proxyHead);
     if (head.length) socket.unshift(head);
+
     proxySocket.pipe(socket);
     socket.pipe(proxySocket);
 
-    socket.on('error', () => proxySocket.destroy());
-    proxySocket.on('error', () => socket.destroy());
-    socket.on('close', () => proxySocket.destroy());
-    proxySocket.on('close', () => socket.destroy());
+    socket.on('error', (e) => { console.error('[ws] client error', e.message); proxySocket.destroy(); });
+    proxySocket.on('error', (e) => { console.error('[ws] backend error', e.message); socket.destroy(); });
+    socket.on('close', () => { console.log('[ws] client closed'); proxySocket.destroy(); });
+    proxySocket.on('close', () => { console.log('[ws] backend closed'); socket.destroy(); });
   });
 
-  proxyReq.on('error', () => socket.destroy());
+  proxyReq.on('error', (e) => { console.error('[ws] request error', e.message); socket.destroy(); });
   proxyReq.end();
 }
 
@@ -182,8 +212,9 @@ function handler(req, res) {
   server.headersTimeout = 125000;
   server.timeout = 0;
   server.listen(VIBE_PORT, '0.0.0.0', () => {
-    console.log(`[VibeCoding] Listening on https://0.0.0.0:${VIBE_PORT}`);
+    console.log(`[VibeCoding] Listening on https://${VIBE_HOST}:${VIBE_PORT}`);
     console.log(`[VibeCoding] Backend: localhost:${CODESERVER_PORT}`);
     if (VIBE_PASSWORD) console.log('[VibeCoding] Password auth enabled');
+    if (VIBE_CERT && VIBE_KEY) console.log('[VibeCoding] ACME certificate renewal available');
   });
 })();

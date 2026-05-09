@@ -49,9 +49,25 @@ param(
     [switch]$InstallVsCodeWeb,
 
     [Parameter(HelpMessage = "Password for VS Code Web login (defaults to VMPassword)")]
-    [string]$VsCodeWebPassword = ""
+    [string]$VsCodeWebPassword = "",
+
+    [Parameter(HelpMessage = "Domain name for VS Code Web (enables ACME cert renewal)")]
+    [string]$VsCodeWebHost = ""
 )
 
+if($VsCodeWebPassword -ne "" -and -not $InstallVsCodeWeb) {
+    Write-Warn "VsCodeWebPassword provided without -InstallVsCodeWeb. Enabling VS Code Web installation. Next time please also add -InstallVsCodeWeb and this warning will not appear."
+    $InstallVsCodeWeb = $true
+}
+if($VsCodeWebHost -ne "" -and -not $InstallVsCodeWeb) {
+    if(-not $DisablePublicIp) {
+        Write-Warn "VsCodeWebHost provided without -InstallVsCodeWeb. Enabling VS Code Web installation. Next time please also add -InstallVsCodeWeb and this warning will not appear."
+        $InstallVsCodeWeb = $true
+    }
+}
+if ($DisablePublicIp -and $VsCodeWebHost) {
+    throw "Unsupported configuration: -DisablePublicIp and -VsCodeWebHost are mutually exclusive. Host-based VS Code Web uses certbot and requires a public IP. Please remove one of these parameters and rerun the script."
+}
 
 if($VMPassword.Length -lt 12 -or -not ($VMPassword -match '[A-Z]') -or -not ($VMPassword -match '[a-z]') -or -not ($VMPassword -match '\d')) {
     throw "VMPassword must be at least 12 characters long and contain at least one uppercase letter, one lowercase letter, and one digit."
@@ -344,8 +360,56 @@ if ($existingVm) {
     }
 }
 
+# ── Validate DNS (after IaC) ────────────────────────────────────────────────
+if ($VsCodeWebHost) {
+    if (-not $publicIp) {
+        throw "Unsupported configuration: -VsCodeWebHost requires a public IP, but no public IP was found."
+    }
+
+    if ($publicIp -match '^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|127\.)') {
+        throw "Unsupported configuration: -VsCodeWebHost requires a public IP, but the VM currently resolves to private IP '$publicIp'."
+    }
+
+    Write-Step "Validating DNS for VS Code Web host '$VsCodeWebHost'"
+    $maxDnsChecks = 12
+    $dnsDelaySeconds = 10
+    $expectedIp = $publicIp
+    $lastResolvedIp = $null
+    $dnsOk = $false
+
+    for ($i = 1; $i -le $maxDnsChecks; $i++) {
+        try {
+            $aRecord = Resolve-DnsName -Name $VsCodeWebHost -Type A -ErrorAction Stop |
+                Select-Object -First 1 -ExpandProperty IPAddress
+            $lastResolvedIp = $aRecord
+            if ($aRecord -eq $expectedIp) {
+                $dnsOk = $true
+                break
+            }
+            Write-Host "  │  Attempt $i/$maxDnsChecks — currently resolves to '$aRecord' (expected '$expectedIp')" -ForegroundColor DarkGray
+        } catch {
+            Write-Host "  │  Attempt $i/$maxDnsChecks — no A record found yet" -ForegroundColor DarkGray
+        }
+
+        if ($i -lt $maxDnsChecks) {
+            Start-Sleep -Seconds $dnsDelaySeconds
+        }
+    }
+
+    if (-not $dnsOk) {
+        if ($lastResolvedIp) {
+            throw "DNS validation failed for '$VsCodeWebHost'. Please update the A record to '$expectedIp' (current: '$lastResolvedIp') and then rerun this script."
+        }
+        throw "DNS validation failed for '$VsCodeWebHost'. Please create an A record with IP '$expectedIp' and then rerun this script."
+    }
+
+    Write-Ok "DNS validated: $VsCodeWebHost → $expectedIp"
+}
+
 # ── Temporary WinRM NSG rule (idempotent) ────────────────────────────────────
 $winrmRuleName = 'Allow-WinRM-HTTPS-Temp'
+$acmeHttpRuleName = 'Allow-ACME-HTTP'
+
 if (-not $DisablePublicIp) {
     Write-Step "Adding temporary WinRM HTTPS rule (removed after setup)"
     $nsg = Get-AzNetworkSecurityGroup -ResourceGroupName $ResourceGroup -Name $nsgName
@@ -365,6 +429,28 @@ if (-not $DisablePublicIp) {
             -DestinationAddressPrefix '*' `
         | Set-AzNetworkSecurityGroup | Out-Null
         Write-Ok "WinRM rule added (will be removed after setup)"
+    }
+
+    if ($VsCodeWebHost) {
+        Write-Step "Adding ACME HTTP rule for certificate validation and renewal"
+        $nsg = Get-AzNetworkSecurityGroup -ResourceGroupName $ResourceGroup -Name $nsgName
+        $existingAcmeRule = $nsg.SecurityRules | Where-Object { $_.Name -eq $acmeHttpRuleName }
+        if ($existingAcmeRule) {
+            Write-Ok "ACME HTTP rule already exists — skipping"
+        } else {
+            $nsg | Add-AzNetworkSecurityRuleConfig `
+                -Name $acmeHttpRuleName `
+                -Priority 1200 `
+                -Direction Inbound `
+                -Access Allow `
+                -Protocol Tcp `
+                -SourcePortRange '*' `
+                -DestinationPortRange '80' `
+                -SourceAddressPrefix '*' `
+                -DestinationAddressPrefix '*' `
+            | Set-AzNetworkSecurityGroup | Out-Null
+            Write-Ok "ACME HTTP rule added"
+        }
     }
 } else {
     Write-Step "Skipping temporary WinRM NSG rule (private connectivity via VPN)"
@@ -757,7 +843,7 @@ Unregister-ScheduledTask -TaskName "InstallVSCodeExtensions" -Confirm:$false -Er
 
         # ── 12. Install VS Code Web interface ─────────────────────────────────
         Invoke-RemoteStep -Session $session -StepName "Installing VS Code Web interface" -Script {
-            param($Password, $Port, $CodeServerPort)
+            param($Password, $Port, $CodeServerPort, $Domain)
             $ProgressPreference = 'SilentlyContinue'
             $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
 
@@ -787,6 +873,154 @@ Unregister-ScheduledTask -TaskName "InstallVSCodeExtensions" -Confirm:$false -Er
             }
             Write-Output "OpenSSL available"
 
+            # Setup certificates and renewal lifecycle
+            $CertsDir = "$VibeDir\certs"
+            $certPath = "$CertsDir\cert.pem"
+            $keyPath = "$CertsDir\key.pem"
+            $metadataPath = "$CertsDir\cert-metadata.txt"
+            $certbotExe = (Get-Command certbot -ErrorAction SilentlyContinue).Source
+            if (-not $certbotExe) {
+                $pyDir = Split-Path (Get-Command python -ErrorAction SilentlyContinue).Source -ErrorAction SilentlyContinue
+                if ($pyDir) { $certbotExe = Join-Path $pyDir 'Scripts\certbot.exe' }
+            }
+            $activeCertPath = $certPath
+            $activeKeyPath = $keyPath
+
+            if (-not (Test-Path $CertsDir)) {
+                New-Item -ItemType Directory -Path $CertsDir -Force | Out-Null
+            }
+
+            function Get-CertificateCN {
+                param([string]$Path)
+                if (-not (Test-Path $Path)) { return $null }
+                try {
+                    $subject = openssl x509 -in $Path -noout -subject 2>$null
+                    if ($subject -match 'CN=([^,/]+)') {
+                        return $matches[1]
+                    }
+                } catch {
+                    return $null
+                }
+                return $null
+            }
+
+            $previous = @{}
+            if (Test-Path $metadataPath) {
+                Get-Content $metadataPath | ForEach-Object {
+                    if ($_ -match '=') {
+                        $k, $v = $_ -split '=', 2
+                        $previous[$k.Trim()] = $v.Trim()
+                    }
+                }
+            }
+            $previousMode = $previous['mode']
+            $previousDomain = $previous['domain']
+
+            if ($Domain) {
+                Write-Output "Setting up certificate for domain: $Domain"
+                $currentCn = Get-CertificateCN -Path $certPath
+                if (-not (Test-Path $certPath) -or $currentCn -ne $Domain) {
+                    if ($currentCn) {
+                        Write-Output "Certificate CN changed ($currentCn -> $Domain), regenerating"
+                    }
+                    openssl req -x509 -newkey rsa:2048 -keyout $keyPath -out $certPath -days 365 -nodes -subj "/CN=$Domain" 2>&1 | Out-Null
+                } else {
+                    Write-Output "Certificate already matches domain: $Domain"
+                }
+
+                if (-not (Test-Path $certbotExe)) {
+                    Write-Output "Installing certbot via pip..."
+                    python -m pip install certbot 2>&1 | Select-Object -Last 3 | ForEach-Object { Write-Output $_ }
+                    $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
+                    $certbotExe = (Get-Command certbot -ErrorAction SilentlyContinue).Source
+                    if (-not $certbotExe) {
+                        $pyDir = Split-Path (Get-Command python -ErrorAction SilentlyContinue).Source -ErrorAction SilentlyContinue
+                        if ($pyDir) { $certbotExe = Join-Path $pyDir 'Scripts\certbot.exe' }
+                    }
+                }
+
+                if (-not (Test-Path $certbotExe)) {
+                    throw "Certbot is not available at '$certbotExe'. Install Python first, then rerun the script."
+                }
+
+                $acmeFirewallRule = "ACME-HTTP-80"
+                $existingAcmeFwRule = Get-NetFirewallRule -DisplayName $acmeFirewallRule -ErrorAction SilentlyContinue
+                if (-not $existingAcmeFwRule) {
+                    New-NetFirewallRule -DisplayName $acmeFirewallRule -Direction Inbound -Protocol TCP -LocalPort 80 -Action Allow | Out-Null
+                }
+
+                $leConfigDir = "C:\Certbot"
+                $leWorkDir = "$leConfigDir\work"
+                $leLogsDir = "$leConfigDir\logs"
+                $leLiveDir = "$leConfigDir\live\$Domain"
+                $leFullChain = "$leLiveDir\fullchain.pem"
+                $lePrivKey = "$leLiveDir\privkey.pem"
+
+                if (-not ((Test-Path $leFullChain) -and (Test-Path $lePrivKey))) {
+                    Write-Output "Requesting ACME certificate via certbot for $Domain"
+                    & $certbotExe certonly --standalone --preferred-challenges http --non-interactive --agree-tos --register-unsafely-without-email --keep-until-expiring -d $Domain --config-dir $leConfigDir --work-dir $leWorkDir --logs-dir $leLogsDir 2>&1 | ForEach-Object { Write-Output $_ }
+                    if ($LASTEXITCODE -ne 0) {
+                        throw "ACME certificate issuance failed for '$Domain'. Ensure TCP/80 is reachable from internet, DNS A record points to '$Domain', then rerun the script."
+                    }
+                } else {
+                    Write-Output "Existing ACME certificate found for $Domain"
+                }
+
+                if (-not ((Test-Path $leFullChain) -and (Test-Path $lePrivKey))) {
+                    throw "ACME issuance did not produce expected certificate files under '$leLiveDir'."
+                }
+
+                $activeCertPath = $leFullChain
+                $activeKeyPath = $lePrivKey
+
+                $renewScript = @"
+`$certbotExe = "$certbotExe"
+`$logFile = "$VibeDir\logs\cert-renewal.log"
+`$ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+if (Test-Path `$certbotExe) {
+    Add-Content `$logFile "`$ts - Starting certificate renewal"
+    & `$certbotExe renew --quiet --agree-tos --config-dir "C:\Certbot" --work-dir "C:\Certbot\work" --logs-dir "C:\Certbot\logs" 2>&1 | Add-Content `$logFile
+    Add-Content `$logFile "`$ts - Renewal exit code: `$LASTEXITCODE"
+} else {
+    Add-Content `$logFile "`$ts - Certbot not installed"
+}
+"@
+                $renewScript | Out-File "$VibeDir\renew-cert.ps1" -Encoding UTF8 -Force
+
+                $existingRenewTask = Get-ScheduledTask -TaskName "CertbotRenewal" -ErrorAction SilentlyContinue
+                if ($existingRenewTask -and $previousMode -eq 'acme' -and $previousDomain -eq $Domain) {
+                    Write-Output "Certbot renewal task already configured for $Domain"
+                } else {
+                    if ($existingRenewTask) {
+                        Unregister-ScheduledTask -TaskName "CertbotRenewal" -Confirm:$false -ErrorAction SilentlyContinue
+                    }
+                    $renewAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$VibeDir\renew-cert.ps1`""
+                    $renewTrigger = New-ScheduledTaskTrigger -Daily -At ([DateTime]"02:00:00")
+                    $renewSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -StartWhenAvailable
+                    Register-ScheduledTask -TaskName "CertbotRenewal" -Action $renewAction -Trigger $renewTrigger -Settings $renewSettings -RunLevel Highest -Force | Out-Null
+                }
+
+                @"
+domain=$Domain
+mode=acme
+lastUpdate=$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+"@ | Out-File $metadataPath -Encoding UTF8 -Force
+            } else {
+                $currentCn = Get-CertificateCN -Path $certPath
+                if (-not (Test-Path $certPath) -or $currentCn -ne 'localhost') {
+                    openssl req -x509 -newkey rsa:2048 -keyout $keyPath -out $certPath -days 365 -nodes -subj '/CN=localhost' 2>&1 | Out-Null
+                }
+                if ($previousMode -eq 'acme') {
+                    Unregister-ScheduledTask -TaskName "CertbotRenewal" -Confirm:$false -ErrorAction SilentlyContinue
+                }
+                @"
+domain=localhost
+mode=self-signed
+lastUpdate=$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+"@ | Out-File $metadataPath -Encoding UTF8 -Force
+            }
+            Write-Output "Certificates ready at $CertsDir"
+
             # Firewall rule
             $ruleName = "VSCodeWeb-HTTPS-$Port"
             $existing = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
@@ -810,15 +1044,34 @@ Unregister-ScheduledTask -TaskName "InstallVSCodeExtensions" -Confirm:$false -Er
             }
 
             # Create startup scripts (PS1 wrappers to avoid cmd.exe issues with special chars)
+            # Run the Node.js VS Code server directly (bypassing code-tunnel.exe whose
+            # Rust WebSocket proxy has a bug that immediately closes connections).
             @'
 $logFile = "C:\vscodeweb\logs\codeserver.log"
-& "C:\Program Files\Microsoft VS Code\bin\code.cmd" serve-web --host 127.0.0.1 --port 8080 --without-connection-token *> $logFile
+# Discover the latest serve-web commit directory
+$serveWebRoot = Join-Path $env:USERPROFILE ".vscode\cli\serve-web"
+$commitDir = Get-ChildItem $serveWebRoot -Directory -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime -Descending | Select-Object -First 1
+if (-not $commitDir) {
+    # Bootstrap: let code-tunnel download the server first, then kill it
+    & "C:\Program Files\Microsoft VS Code\bin\code.cmd" serve-web --host 127.0.0.1 --port 8080 --without-connection-token --accept-server-license-terms &
+    Start-Sleep -Seconds 30
+    Get-Process -Name "code-tunnel" -ErrorAction SilentlyContinue | Stop-Process -Force
+    $commitDir = Get-ChildItem $serveWebRoot -Directory -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+}
+if (-not $commitDir) { Write-Error "No serve-web commit found"; exit 1 }
+$base = $commitDir.FullName
+& "$base\node.exe" "$base\out\server-main.js" --port 8080 --host 127.0.0.1 --without-connection-token --accept-server-license-terms *> $logFile
 '@ | Out-File "$VibeDir\start-codeserver.ps1" -Encoding UTF8 -Force
 
             @"
 `$env:CODESERVER_PORT = "$CodeServerPort"
 `$env:VIBE_PORT = "$Port"
 `$env:VIBE_PASSWORD = "$Password"
+`$env:VIBE_HOST = "$(if ($Domain) { $Domain } else { 'localhost' })"
+`$env:VIBE_CERT = "$activeCertPath"
+`$env:VIBE_KEY = "$activeKeyPath"
 Set-Location "$VibeDir"
 & node server.js *> "$VibeDir\logs\vscodeweb.log"
 "@ | Out-File "$VibeDir\start-vscodeweb.ps1" -Encoding UTF8 -Force
@@ -835,7 +1088,7 @@ Set-Location "$VibeDir"
             Register-ScheduledTask -TaskName "VSCodeWeb-Proxy" -Action $vibeAction -Trigger $vibeTrigger -Settings $vibeSettings -RunLevel Highest -User "$env:USERNAME" -Password $Password -Force | Out-Null
 
             Write-Output "VS Code Web services registered (auto-start on boot)"
-        } -ArgumentList $vsCodeWebPw, 9443, 8080
+        } -ArgumentList $vsCodeWebPw, 9443, 8080, $VsCodeWebHost
     }
 
     # ── 13. Verify all software installed ────────────────────────────────
@@ -925,7 +1178,8 @@ Write-Host "  Windows 11 Dev VM deployed successfully!" -ForegroundColor Green
 Write-Host ""
 Write-Host "  RDP Address       : $publicIp" -ForegroundColor White
 if($InstallVsCodeWeb) {
-    Write-Host "  VS Code Web       : https://${publicIp}:9443" -ForegroundColor White
+    $vsCodeWebEndpoint = if ($VsCodeWebHost) { "https://${VsCodeWebHost}:9443" } else { "https://${publicIp}:9443" }
+    Write-Host "  VS Code Web       : $vsCodeWebEndpoint" -ForegroundColor White
 }
 Write-Host "  Username          : $VMUser" -ForegroundColor White
 Write-Host "  Password          : (as provided)" -ForegroundColor White
@@ -965,6 +1219,7 @@ session bpp:i:32
 audiomode:i:0
 authentication level:i:0
 prompt for credentials:i:1
+redirectclipboard:i:1
 "@
     $profileDir = Split-Path $MstscProfilePath -Parent
     if ($profileDir -and -not (Test-Path $profileDir)) {

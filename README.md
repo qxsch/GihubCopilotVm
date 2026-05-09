@@ -137,6 +137,7 @@ When `-DisablePublicIp` is set:
 
 ```powershell
 # Step 1 — Deploy hub VPN (can be in a shared/hub subscription)
+# In case you already have a hub, just note the Hub VNet Resource ID and skip to step 2
 Select-AzSubscription "Hub-Subscription"
 .\deploy-vpn.ps1 -ResourceGroup "hubnet" -Location "Norway East"
 # Note the VNet Resource ID from the summary output
