@@ -46,9 +46,14 @@ Write-Output "Node.js: $(node --version)"
 
 # ─── 2. Verify VS Code serve-web ─────────────────────────────────────────────
 Write-Output "`n>>> Checking VS Code serve-web..."
-$codeBin = "C:\Program Files\Microsoft VS Code\bin\code.cmd"
-if (-not (Test-Path $codeBin)) { throw "VS Code not found at $codeBin" }
-Write-Output "VS Code serve-web backend ready"
+$serveWebBase = "$env:USERPROFILE\.vscode\cli\serve-web"
+$commitDir = Get-ChildItem $serveWebBase -Directory -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+if (-not $commitDir) { throw "VS Code serve-web not found. Run 'code.cmd serve-web' once to initialize." }
+$nodePath = Join-Path $commitDir.FullName "node.exe"
+$serverMainPath = Join-Path $commitDir.FullName "out\server-main.js"
+if (-not (Test-Path $nodePath)) { throw "node.exe not found at $nodePath" }
+if (-not (Test-Path $serverMainPath)) { throw "server-main.js not found at $serverMainPath" }
+Write-Output "VS Code serve-web backend ready at $($commitDir.Name)"
 
 # ─── 3. Deploy proxy ─────────────────────────────────────────────────────────
 Write-Output "`n>>> Deploying VS Code Web proxy..."
@@ -96,13 +101,62 @@ if ((Get-Item $serverExtDir -ErrorAction SilentlyContinue).Attributes -band [IO.
     Write-Output "Symlinked serve-web extensions -> desktop extensions"
 }
 
-# ─── 7. Create startup scripts ───────────────────────────────────────────────
+# ─── 7. Patch VS Code server for 30-day session persistence ──────────────────
+Write-Output "`n>>> Patching VS Code serve-web for 30-day reconnection grace time..."
+$serveWebDir = "$env:USERPROFILE\.vscode\cli\serve-web"
+if (Test-Path $serveWebDir) {
+    Get-ChildItem $serveWebDir -Filter "server-main.js" -Recurse | ForEach-Object {
+        $c = Get-Content $_.FullName -Raw
+        $old = 'reconnection-grace-time"],108e5)'
+        $new = 'reconnection-grace-time"],2592e6)'
+        if ($c.Contains($old)) {
+            $c = $c.Replace($old, $new)
+            [System.IO.File]::WriteAllText($_.FullName, $c)
+            Write-Output "  Patched: $($_.FullName) (3h -> 30d)"
+        } else {
+            Write-Output "  Already patched or not needed: $($_.FullName)"
+        }
+    }
+}
+
+# ─── 8. VS Code Machine settings (terminal persistence) ──────────────────────
+Write-Output "`n>>> Configuring VS Code Machine settings..."
+$machineDir = "$env:USERPROFILE\.vscode-server\data\Machine"
+if (-not (Test-Path $machineDir)) { New-Item -ItemType Directory -Path $machineDir -Force | Out-Null }
+@'
+{
+  "terminal.integrated.enablePersistentSessions": true,
+  "terminal.integrated.persistentSessionReviveProcess": "onExitAndWindowClose",
+  "terminal.integrated.persistentSessionScrollback": 10000
+}
+'@ | Out-File -FilePath "$machineDir\settings.json" -Encoding UTF8 -Force
+Write-Output "Machine settings written"
+
+# ─── 9. Create startup scripts ───────────────────────────────────────────────
 Write-Output "`n>>> Creating startup scripts..."
 
 # VS Code serve-web startup (PS1 wrapper with logging)
+# Launches server-main.js directly (bypasses code-tunnel.exe which breaks WebSocket)
+# Also re-applies 30-day reconnection grace time patch on each start (survives VS Code updates)
 @'
 $logFile = "C:\vscodeweb\logs\codeserver.log"
-& "C:\Program Files\Microsoft VS Code\bin\code.cmd" serve-web --host 127.0.0.1 --port 8080 --without-connection-token *> $logFile
+
+# Find the serve-web directory (commit hash)
+$serveWebBase = "$env:USERPROFILE\.vscode\cli\serve-web"
+$commitDir = Get-ChildItem $serveWebBase -Directory | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+if (-not $commitDir) { throw "No serve-web directory found" }
+
+# Re-apply 30-day grace time patch (survives VS Code auto-updates)
+$serverMainPath = Join-Path $commitDir.FullName "out\server-main.js"
+$c = Get-Content $serverMainPath -Raw
+if ($c.Contains('reconnection-grace-time"],108e5)')) {
+    $c = $c.Replace('reconnection-grace-time"],108e5)', 'reconnection-grace-time"],2592e6)')
+    [System.IO.File]::WriteAllText($serverMainPath, $c)
+}
+
+# Launch server-main.js directly on TCP (no code-tunnel.exe wrapper)
+$nodePath = Join-Path $commitDir.FullName "node.exe"
+& $nodePath $serverMainPath --host 127.0.0.1 --port 8080 --without-connection-token --accept-server-license-terms *> $logFile
 '@ | Out-File -FilePath "$VibeDir\start-codeserver.ps1" -Encoding UTF8 -Force
 
 # Proxy startup (.ps1 to preserve ! in password)
@@ -114,7 +168,7 @@ Set-Location "$VibeDir"
 & node server.js *> "$VibeDir\logs\vscodeweb.log"
 "@ | Out-File -FilePath "$VibeDir\start-vscodeweb.ps1" -Encoding UTF8 -Force
 
-# ─── 8. Register scheduled tasks (Password logon = runs without interactive login) ─
+# ─── 10. Register scheduled tasks (Password logon = runs without interactive login) ─
 Write-Output "`n>>> Registering auto-start tasks..."
 
 $csAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$VibeDir\start-codeserver.ps1`""

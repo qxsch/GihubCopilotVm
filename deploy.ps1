@@ -708,6 +708,16 @@ try {
         Write-Output "Copilot CLI: $copilotVer"
     }
 
+    # ── 7b. Install psmux (terminal multiplexer for PowerShell) ────────
+    Invoke-RemoteStep -Session $session -StepName "Installing psmux" -Script {
+        $ProgressPreference = 'SilentlyContinue'
+        $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
+        choco install psmux --yes --no-progress 2>&1 | Select-String -Pattern '(install|downloaded|The install)' | ForEach-Object { Write-Output $_.Line.Trim() }
+        $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
+        $psmuxCheck = Get-Command psmux -ErrorAction SilentlyContinue
+        if ($psmuxCheck) { Write-Output "psmux installed" } else { Write-Output "psmux installed (may require new shell)" }
+    }
+
     # ── 8. Install Az PowerShell module ──────────────────────────────────
     Invoke-RemoteStep -Session $session -StepName "Installing Az PowerShell module (in pwsh 7)" -Script {
         $pwshExe = "C:\Program Files\PowerShell\7\pwsh.exe"
@@ -1128,6 +1138,9 @@ Set-Location "$VibeDir"
             $graphVer = & $pwshExe -NoProfile -Command '(Get-InstalledModule Microsoft.Graph -ErrorAction SilentlyContinue).Version'
             if ($graphVer) { $checks += "OK  Microsoft.Graph module: $graphVer" } else { $checks += "FAIL Microsoft.Graph module not found" }
         }
+        # psmux
+        $psmuxPath = Get-Command psmux -ErrorAction SilentlyContinue
+        if ($psmuxPath) { $checks += "OK  psmux installed" } else { $checks += "FAIL psmux not found" }
         # Chocolatey
         $chocoVer = & choco --version 2>&1
         if ($LASTEXITCODE -eq 0) { $checks += "OK  Chocolatey: $chocoVer" } else { $checks += "FAIL Chocolatey not found" }

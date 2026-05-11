@@ -38,6 +38,7 @@ The script provisions the VM, connects via WinRM, installs all dev tools, and ha
 | Az PowerShell module | Latest |
 | Microsoft.Graph module | Latest |
 | Node.js (LTS) | Latest |
+| psmux | Latest (terminal multiplexer for PowerShell) |
 | Chocolatey | Latest |
 
 ### VS Code Extensions (auto-installed on first login)
@@ -92,6 +93,7 @@ cd GihubCopilotVm
 | `-OpenMstsc` | `$false` | Launch Remote Desktop after deployment |
 | `-InstallVsCodeWeb` | `$false` | Deploy VS Code Web (HTTPS proxy with login on port 9443) |
 | `-VsCodeWebPassword` | *(VMPassword)* | Password for VS Code Web login |
+| `-VsCodeWebHost` | *(empty)* | Domain name for VS Code Web (enables ACME/Let's Encrypt certificates) |
 
 ### Examples
 
@@ -105,6 +107,10 @@ cd GihubCopilotVm
 # Deploy with VS Code Web interface
 .\deploy.ps1 -VMPassword 'P@ss1234abcd' -InstallVsCodeWeb
 # Then open https://<public-ip>:9443 in your browser
+
+# Deploy with VS Code Web + trusted ACME certificate
+.\deploy.ps1 -VMPassword 'P@ss1234abcd' -InstallVsCodeWeb -VsCodeWebHost 'myvm.example.com'
+# Then open https://myvm.example.com:9443 in your browser
 ```
 
 ---
@@ -242,7 +248,7 @@ This creates VNet peering between the hub and spoke, keeps the public IP, and al
 2. **VNet peering** *(when `-HubVnetId` is provided)* — Creates spoke→hub and hub→spoke peering with gateway transit enabled, allowing VPN clients to reach the VM's private IP.
 3. **Remote configuration** — Opens a temporary WinRM port (skipped when `-DisablePublicIp` is set, since traffic flows over the VPN tunnel), establishes a PowerShell Remoting session to the VM's IP, and runs setup steps with live progress output.
 4. **Software installation** — Installs Chocolatey, enables Windows features, then installs Docker (auto-start), Git, Python, PowerShell 7, VS Code, GitHub CLI, Az & Graph modules.
-5. **VS Code Web** *(optional)* — Deploys a Node.js HTTPS reverse proxy on port 9443 with password-based login, backed by `code serve-web` on localhost:8080. Desktop extensions are symlinked so they appear in the web UI.
+5. **VS Code Web** *(optional)* — Deploys a Node.js HTTPS reverse proxy on port 9443 with password-based login, backed by VS Code's `server-main.js` running directly on localhost:8080. Desktop extensions are symlinked so they appear in the web UI. When `-VsCodeWebHost` is provided, an ACME/Let's Encrypt certificate is issued via certbot with automatic daily renewal.
 6. **Cleanup & restart** — Removes the WinRM NSG rule (if it was added), restarts the VM to finalize Docker/WSL2 setup.
 
 The deployment is **idempotent** — re-running the script skips the Bicep deployment if the VM already exists.
@@ -253,9 +259,42 @@ The deployment is **idempotent** — re-running the script skips the Bicep deplo
 
 - WinRM HTTPS is used only during provisioning; In public IP mode, the NSG rule is **automatically removed** after setup completes. In private IP mode, the rule is never added since provisioning happens over the VPN tunnel.
 - RDP (3389) and optionally VS Code Web (9443) are open in the NSG. Consider restricting the source IP to your own address, when running in public IP mode.
-- VS Code Web uses a self-signed TLS certificate and password-based session cookies.
+- VS Code Web uses a self-signed TLS certificate by default (or ACME/Let's Encrypt when `-VsCodeWebHost` is provided) and password-based session cookies.
 - Trusted Launch with Secure Boot and vTPM is enabled by default.
 - VM password must meet complexity requirements (12+ characters, mixed case, digit).
+
+---
+
+## VS Code Web
+
+When deployed with `-InstallVsCodeWeb`, the VM runs a browser-accessible VS Code instance on port 9443.
+
+### Architecture
+
+- **Backend**: VS Code's `server-main.js` runs directly via Node.js on port 8080 (bypasses `code-tunnel.exe` which has WebSocket issues)
+- **Proxy**: Node.js HTTPS reverse proxy on port 9443 handles TLS termination, password login, and WebSocket relay
+- **Persistence**: Reconnection grace time is patched to 30 days — browser sessions survive tab closes, machine sleep, and network interruptions
+- Both services are registered as Windows Scheduled Tasks and auto-start on boot
+
+### Session Picker
+
+After login, users see a session picker at `/vibe-sessions` with:
+
+- **Active Sessions** — clickable list of workspaces with live WebSocket connections (green indicators, connection count badges)
+- **Recent Sessions** — previously opened workspaces sorted by last access
+- **Discovered Projects** — auto-scanned folders from Documents, source, repos, projects, and Desktop
+- **Manual folder entry** — open any folder by typing its path
+
+Active sessions are tracked per-folder through WebSocket connection monitoring.
+
+### Certificates
+
+| Mode | Trigger | Details |
+|------|---------|----------|
+| Self-signed | Default (no `-VsCodeWebHost`) | Generated via OpenSSL, CN=localhost |
+| ACME/Let's Encrypt | `-VsCodeWebHost myvm.example.com` | Issued via certbot, daily auto-renewal via scheduled task |
+
+> **Note:** ACME mode requires the domain's A record to point to the VM's public IP and TCP port 80 to be reachable.
 
 ---
 
@@ -265,10 +304,10 @@ The deployment is **idempotent** — re-running the script skips the Bicep deplo
 ├── deploy.ps1          # Main deployment orchestrator
 ├── deploy-vpn.ps1      # Hub VNet + P2S VPN Gateway deployment
 ├── vscodeweb/
-│   └── server.js       # HTTPS auth proxy for VS Code Web
+│   ├── server.js       # HTTPS auth proxy with session picker for VS Code Web
+│   └── setup-vscodeweb.ps1  # VM setup script for VS Code Web infrastructure
 ├── infra/
-│   ├── main.bicep      # Azure infrastructure template
-│   └── setup.ps1       # Standalone VM setup script (for manual use)
+│   └── main.bicep      # Azure infrastructure template
 └── README.md
 ```
 
