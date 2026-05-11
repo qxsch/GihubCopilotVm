@@ -867,6 +867,15 @@ Unregister-ScheduledTask -TaskName "InstallVSCodeExtensions" -Confirm:$false -Er
             }
             Write-Output "Node.js: $(node --version)"
 
+            # Install ws dependency (required by server.js for WebSocket proxying)
+            Push-Location $VibeDir
+            if (-not (Test-Path "$VibeDir\node_modules\ws")) {
+                & npm init -y 2>&1 | Out-Null
+                & npm install ws 2>&1 | Out-Null
+            }
+            Pop-Location
+            Write-Output "ws dependency ready"
+
             # VS Code serve-web is used as the backend (built into VS Code, no extra install needed)
             $codeBin = "C:\Program Files\Microsoft VS Code\bin\code.cmd"
             if (-not (Test-Path $codeBin)) { throw "VS Code not found at $codeBin" }
@@ -1058,21 +1067,44 @@ lastUpdate=$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
             # Rust WebSocket proxy has a bug that immediately closes connections).
             @'
 $logFile = "C:\vscodeweb\logs\codeserver.log"
-# Discover the latest serve-web commit directory
-$serveWebRoot = Join-Path $env:USERPROFILE ".vscode\cli\serve-web"
-$commitDir = Get-ChildItem $serveWebRoot -Directory -ErrorAction SilentlyContinue |
-    Sort-Object LastWriteTime -Descending | Select-Object -First 1
-if (-not $commitDir) {
-    # Bootstrap: let code-tunnel download the server first, then kill it
-    & "C:\Program Files\Microsoft VS Code\bin\code.cmd" serve-web --host 127.0.0.1 --port 8080 --without-connection-token --accept-server-license-terms &
-    Start-Sleep -Seconds 30
-    Get-Process -Name "code-tunnel" -ErrorAction SilentlyContinue | Stop-Process -Force
-    $commitDir = Get-ChildItem $serveWebRoot -Directory -ErrorAction SilentlyContinue |
-        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+$serveWebBase = "$env:USERPROFILE\.vscode\cli\serve-web"
+$commitDir = Get-ChildItem $serveWebBase -Directory | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+if (-not $commitDir) { throw "No serve-web directory found" }
+$serverMainPath = Join-Path $commitDir.FullName "out\server-main.js"
+$c = Get-Content $serverMainPath -Raw
+if ($c.Contains('reconnection-grace-time"],108e5)')) {
+    $c = $c.Replace('reconnection-grace-time"],108e5)', 'reconnection-grace-time"],2592e6)')
+    [System.IO.File]::WriteAllText($serverMainPath, $c)
 }
-if (-not $commitDir) { Write-Error "No serve-web commit found"; exit 1 }
-$base = $commitDir.FullName
-& "$base\node.exe" "$base\out\server-main.js" --port 8080 --host 127.0.0.1 --without-connection-token --accept-server-license-terms *> $logFile
+
+# Patch workbench to enable persistent secret storage (GitHub Copilot auth)
+$wbPath = Join-Path $commitDir.FullName "out\vs\workbench\workbench.web.main.internal.js"
+if (Test-Path $wbPath) {
+    $wb = [System.IO.File]::ReadAllText($wbPath)
+    $changed = $false
+    # Patch 1: Disable forced in-memory storage for SecretStorageService
+    if ($wb.Contains('extends Zke{constructor(i,e,t,o){super(!0,i,e,o)')) {
+        $wb = $wb.Replace(
+            'extends Zke{constructor(i,e,t,o){super(!0,i,e,o)',
+            'extends Zke{constructor(i,e,t,o){super(!1,i,e,o)'
+        )
+        $changed = $true
+    }
+    # Patch 2: Make encryption service report as available (uses identity encrypt/decrypt)
+    if ($wb.Contains('isEncryptionAvailable(){return Promise.resolve(!1)}')) {
+        $wb = $wb.Replace(
+            'isEncryptionAvailable(){return Promise.resolve(!1)}',
+            'isEncryptionAvailable(){return Promise.resolve(!0)}'
+        )
+        $changed = $true
+    }
+    if ($changed) {
+        [System.IO.File]::WriteAllText($wbPath, $wb, [System.Text.Encoding]::UTF8)
+    }
+}
+
+$nodePath = Join-Path $commitDir.FullName "node.exe"
+& $nodePath $serverMainPath --host 127.0.0.1 --port 8080 --without-connection-token --accept-server-license-terms *> $logFile
 '@ | Out-File "$VibeDir\start-codeserver.ps1" -Encoding UTF8 -Force
 
             @"

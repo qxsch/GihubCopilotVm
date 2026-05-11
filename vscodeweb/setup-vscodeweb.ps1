@@ -18,13 +18,25 @@
 
 .PARAMETER CodeServerPort
     Internal port for VS Code serve-web (default 8080).
+
+.PARAMETER Host
+    Hostname / domain for the proxy (default localhost). Used for VIBE_HOST env var.
+
+.PARAMETER CertPath
+    Path to TLS certificate (fullchain.pem). Falls back to self-signed in C:\vscodeweb\certs.
+
+.PARAMETER KeyPath
+    Path to TLS private key (privkey.pem). Falls back to self-signed in C:\vscodeweb\certs.
 #>
 param(
     [Parameter(Mandatory)]
     [string]$Password,
 
     [int]$Port = 9443,
-    [int]$CodeServerPort = 8080
+    [int]$CodeServerPort = 8080,
+    [string]$Host = 'localhost',
+    [string]$CertPath,
+    [string]$KeyPath
 )
 
 $ErrorActionPreference = 'Stop'
@@ -66,6 +78,16 @@ if (Test-Path $serverSrc) {
     Copy-Item $serverSrc "$VibeDir\server.js" -Force
     Write-Output "server.js deployed"
 }
+
+# Install ws dependency (required by server.js for WebSocket proxying)
+Push-Location $VibeDir
+if (-not (Test-Path "$VibeDir\node_modules\ws")) {
+    Write-Output "Installing ws npm package..."
+    & npm init -y 2>&1 | Out-Null
+    & npm install ws 2>&1 | Out-Null
+}
+Pop-Location
+Write-Output "ws dependency ready"
 
 # ─── 4. Install OpenSSL for cert generation (if needed) ──────────────────────
 Write-Output "`n>>> Checking OpenSSL..."
@@ -140,13 +162,9 @@ Write-Output "`n>>> Creating startup scripts..."
 # Also re-applies 30-day reconnection grace time patch on each start (survives VS Code updates)
 @'
 $logFile = "C:\vscodeweb\logs\codeserver.log"
-
-# Find the serve-web directory (commit hash)
 $serveWebBase = "$env:USERPROFILE\.vscode\cli\serve-web"
 $commitDir = Get-ChildItem $serveWebBase -Directory | Sort-Object LastWriteTime -Descending | Select-Object -First 1
 if (-not $commitDir) { throw "No serve-web directory found" }
-
-# Re-apply 30-day grace time patch (survives VS Code auto-updates)
 $serverMainPath = Join-Path $commitDir.FullName "out\server-main.js"
 $c = Get-Content $serverMainPath -Raw
 if ($c.Contains('reconnection-grace-time"],108e5)')) {
@@ -154,16 +172,56 @@ if ($c.Contains('reconnection-grace-time"],108e5)')) {
     [System.IO.File]::WriteAllText($serverMainPath, $c)
 }
 
-# Launch server-main.js directly on TCP (no code-tunnel.exe wrapper)
+# Patch workbench to enable persistent secret storage (GitHub Copilot auth)
+$wbPath = Join-Path $commitDir.FullName "out\vs\workbench\workbench.web.main.internal.js"
+if (Test-Path $wbPath) {
+    $wb = [System.IO.File]::ReadAllText($wbPath)
+    $changed = $false
+    # Patch 1: Disable forced in-memory storage for SecretStorageService
+    if ($wb.Contains('extends Zke{constructor(i,e,t,o){super(!0,i,e,o)')) {
+        $wb = $wb.Replace(
+            'extends Zke{constructor(i,e,t,o){super(!0,i,e,o)',
+            'extends Zke{constructor(i,e,t,o){super(!1,i,e,o)'
+        )
+        $changed = $true
+    }
+    # Patch 2: Make encryption service report as available (uses identity encrypt/decrypt)
+    if ($wb.Contains('isEncryptionAvailable(){return Promise.resolve(!1)}')) {
+        $wb = $wb.Replace(
+            'isEncryptionAvailable(){return Promise.resolve(!1)}',
+            'isEncryptionAvailable(){return Promise.resolve(!0)}'
+        )
+        $changed = $true
+    }
+    if ($changed) {
+        [System.IO.File]::WriteAllText($wbPath, $wb, [System.Text.Encoding]::UTF8)
+    }
+}
+
 $nodePath = Join-Path $commitDir.FullName "node.exe"
 & $nodePath $serverMainPath --host 127.0.0.1 --port 8080 --without-connection-token --accept-server-license-terms *> $logFile
 '@ | Out-File -FilePath "$VibeDir\start-codeserver.ps1" -Encoding UTF8 -Force
+
+# Resolve certificate paths (use ACME certs if available, else self-signed)
+if (-not $CertPath) {
+    $acmeCert = "C:\Certbot\live\$Host\fullchain.pem"
+    if ($Host -ne 'localhost' -and (Test-Path $acmeCert)) {
+        $CertPath = $acmeCert
+        $KeyPath = "C:\Certbot\live\$Host\privkey.pem"
+    } else {
+        $CertPath = "$VibeDir\certs\cert.pem"
+        $KeyPath = "$VibeDir\certs\key.pem"
+    }
+}
 
 # Proxy startup (.ps1 to preserve ! in password)
 @"
 `$env:CODESERVER_PORT = "$CodeServerPort"
 `$env:VIBE_PORT = "$Port"
 `$env:VIBE_PASSWORD = "$Password"
+`$env:VIBE_HOST = "$Host"
+`$env:VIBE_CERT = "$CertPath"
+`$env:VIBE_KEY = "$KeyPath"
 Set-Location "$VibeDir"
 & node server.js *> "$VibeDir\logs\vscodeweb.log"
 "@ | Out-File -FilePath "$VibeDir\start-vscodeweb.ps1" -Encoding UTF8 -Force

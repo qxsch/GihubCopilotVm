@@ -352,7 +352,7 @@ function showSessionPicker(res) {
 <div class="container">
   <div class="header">
     <h1>&#9889; VibeCoding</h1>
-    <a class="btn" href="/" style="flex:0">Empty Editor</a>
+    <a class="btn" href="/?folder=" style="flex:0">Empty Editor</a>
   </div>
   <div class="status">
     <span class="dot ${activeSessions.length > 0 || processCount > 0 || totalWs > 0 ? 'dot-active' : 'dot-idle'}"></span>
@@ -464,6 +464,8 @@ function proxyRequest(req, res) {
         body = body.split(backendAddr).join(proxyHost);
         const hdrs = { ...proxyRes.headers };
         hdrs['content-length'] = Buffer.byteLength(body);
+        // Set cookie so workbench.js uses encrypted localStorage for secrets
+        hdrs['set-cookie'] = 'vscode-secret-key-path=/_vscode-cli/mint-key; Path=/; SameSite=Strict; Secure';
         res.writeHead(200, hdrs);
         res.end(body);
       });
@@ -543,9 +545,36 @@ function handleUpgrade(req, socket, head) {
   });
 }
 
+// ─── Stable server key for VS Code secret encryption ─────────────────────────
+// VS Code Web's e9t class POSTs to /_vscode-cli/mint-key expecting 32 raw bytes.
+// It XORs this server key with a client key to derive an AES-GCM encryption key
+// for secrets stored in browser localStorage. Key must be stable across restarts.
+const MINT_KEY_PATH = path.join(__dirname, '.mint-key');
+function getMintKey() {
+  try {
+    const buf = fs.readFileSync(MINT_KEY_PATH);
+    if (buf.length === 32) return buf;
+  } catch {}
+  const key = crypto.randomBytes(32);
+  fs.writeFileSync(MINT_KEY_PATH, key, { mode: 0o600 });
+  return key;
+}
+const MINT_KEY = getMintKey();
+
 // ─── Request handler ─────────────────────────────────────────────────────────
 function handler(req, res) {
   const parsedUrl = new URL(req.url, `https://${req.headers.host || 'localhost'}`);
+
+  // VS Code secret encryption key endpoint
+  if (req.method === 'POST' && parsedUrl.pathname === '/_vscode-cli/mint-key') {
+    res.writeHead(200, {
+      'Content-Type': 'application/octet-stream',
+      'Content-Length': 32,
+      'Cache-Control': 'no-store',
+    });
+    res.end(MINT_KEY);
+    return;
+  }
 
   if (VIBE_PASSWORD) {
     if (req.method === 'POST' && parsedUrl.pathname === '/vibe-login') {
@@ -567,9 +596,16 @@ function handler(req, res) {
     }
   }
 
+  // No folder specified on root → go to session picker
+  const folder = parsedUrl.searchParams.get('folder');
+  if (parsedUrl.pathname === '/' && folder === null) {
+    res.writeHead(302, { 'Location': '/vibe-sessions' });
+    res.end();
+    return;
+  }
+
   // Normalize folder URI: redirect ?folder=C:/... to ?folder=/C:/... so the
   // remote file-system provider registers correctly (prevents ENOPRO).
-  const folder = parsedUrl.searchParams.get('folder');
   if (folder && parsedUrl.pathname === '/') {
     const canonical = toFolderUri(folder);
     if (canonical !== folder) {
