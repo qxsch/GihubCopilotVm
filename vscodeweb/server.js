@@ -462,6 +462,57 @@ function proxyRequest(req, res) {
         const proxyHost = req.headers.host || `${VIBE_HOST}:${VIBE_PORT}`;
         body = body.split(`http://${backendAddr}`).join(`https://${proxyHost}`);
         body = body.split(backendAddr).join(proxyHost);
+
+        // Inject server-state sync script BEFORE any other scripts run.
+        // This synchronously loads persisted state into localStorage so VS Code
+        // picks up credentials/settings from the VM regardless of which browser.
+        // Extract nonce from CSP header to allow our inline script
+        const cspHeader = proxyRes.headers['content-security-policy'] || '';
+        const nonceMatch = cspHeader.match(/nonce-([^']+)/);
+        const nonce = nonceMatch ? nonceMatch[1] : '1nline-m4p';
+        const syncScript = `<script nonce="${nonce}">
+(function(){
+  try {
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', '/_vscode-server-state', false);
+    xhr.send();
+    if (xhr.status === 200) {
+      var state = JSON.parse(xhr.responseText);
+      var keys = Object.keys(state);
+      for (var i = 0; i < keys.length; i++) {
+        var current = localStorage.getItem(keys[i]);
+        if (current !== state[keys[i]]) {
+          localStorage.setItem(keys[i], state[keys[i]]);
+        }
+      }
+    }
+  } catch(e) { console.warn('[VibeCoding] state sync load failed:', e); }
+  // Periodically push localStorage changes back to server
+  var _lastHash = '';
+  function syncBack() {
+    try {
+      var obj = {};
+      for (var i = 0; i < localStorage.length; i++) {
+        var k = localStorage.key(i);
+        obj[k] = localStorage.getItem(k);
+      }
+      var hash = JSON.stringify(obj);
+      if (hash !== _lastHash) {
+        _lastHash = hash;
+        var xhr2 = new XMLHttpRequest();
+        xhr2.open('PUT', '/_vscode-server-state', true);
+        xhr2.setRequestHeader('Content-Type', 'application/json');
+        xhr2.send(hash);
+      }
+    } catch(e) {}
+  }
+  setInterval(syncBack, 3000);
+  window.addEventListener('beforeunload', syncBack);
+})();
+</script>`;
+        // Insert sync script right after <head> (or at start of body)
+        body = body.replace('<head>', '<head>' + syncScript);
+
         const hdrs = { ...proxyRes.headers };
         hdrs['content-length'] = Buffer.byteLength(body);
         // Set cookie so workbench.js uses encrypted localStorage for secrets
@@ -545,6 +596,33 @@ function handleUpgrade(req, socket, head) {
   });
 }
 
+// ─── Server-side localStorage sync ───────────────────────────────────────────
+// Persists localStorage state on the VM so credentials (GitHub Copilot, etc.)
+// survive across different browsers/devices.
+const STATE_FILE = path.join(__dirname, '.server-state.json');
+
+function loadServerState() {
+  try {
+    if (fs.existsSync(STATE_FILE)) {
+      return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+    }
+  } catch (e) {
+    console.warn('[VibeCoding] Failed to load server state:', e.message);
+  }
+  return {};
+}
+
+function saveServerState(state) {
+  try {
+    fs.writeFileSync(STATE_FILE, JSON.stringify(state), 'utf8');
+  } catch (e) {
+    console.warn('[VibeCoding] Failed to save server state:', e.message);
+  }
+}
+
+let _serverState = loadServerState();
+console.log(`[VibeCoding] Loaded server state (${Object.keys(_serverState).length} keys)`);
+
 // ─── Stable server key for VS Code secret encryption ─────────────────────────
 // VS Code Web's e9t class POSTs to /_vscode-cli/mint-key expecting 32 raw bytes.
 // It XORs this server key with a client key to derive an AES-GCM encryption key
@@ -574,6 +652,36 @@ function handler(req, res) {
     });
     res.end(MINT_KEY);
     return;
+  }
+
+  // Server-side localStorage state endpoints
+  if (parsedUrl.pathname === '/_vscode-server-state') {
+    if (req.method === 'GET') {
+      if (VIBE_PASSWORD && !getSession(req)) { res.writeHead(401); res.end(); return; }
+      const body = JSON.stringify(_serverState);
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body), 'Cache-Control': 'no-store' });
+      res.end(body);
+      return;
+    }
+    if (req.method === 'PUT') {
+      if (VIBE_PASSWORD && !getSession(req)) { res.writeHead(401); res.end(); return; }
+      let body = '';
+      req.on('data', c => { body += c; if (body.length > 1e6) req.destroy(); });
+      req.on('end', () => {
+        try {
+          const incoming = JSON.parse(body);
+          // Merge incoming state (allows partial updates)
+          Object.assign(_serverState, incoming);
+          saveServerState(_serverState);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end('{"ok":true}');
+        } catch {
+          res.writeHead(400);
+          res.end('Bad request');
+        }
+      });
+      return;
+    }
   }
 
   if (VIBE_PASSWORD) {
